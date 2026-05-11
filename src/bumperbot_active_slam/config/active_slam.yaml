@@ -1,0 +1,36 @@
+active_slam_node:
+  ros__parameters:
+    use_sim_time: true
+
+    map_topic: /map
+    global_frame: map
+    robot_base_frame: base_footprint
+    nav2_action_name: /navigate_to_pose
+
+    control_period_sec: 2.0
+    goal_cooldown_sec: 3.0
+    blacklist_duration_sec: 90.0
+    blacklist_radius_m: 1.0
+    nav_timeout_sec: 25.0
+
+    unknown_value: -1
+    free_max_value: 25
+    occupied_min_value: 65
+
+    min_frontier_cells: 20
+    min_goal_distance_m: 0.6
+    max_goal_distance_m: 8.0
+    goal_clearance_radius_m: 0.20
+    goal_backoff_m: 0.40
+    same_goal_tolerance_m: 0.30
+
+    lambda_distance: 0.08
+    entropy_weight: 1.0
+    frontier_size_weight: 0.05
+    frontier_size_norm_cells: 80.0
+    entropy_neighborhood_radius_cells: 2
+
+    publish_markers: true
+    marker_topic: /active_slam/frontiers
+    selected_goal_topic: /active_slam/selected_goal
+    status_topic: /active_slam/status
