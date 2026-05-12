@@ -9,7 +9,9 @@ active_slam_node:
     compute_path_action_name: /compute_path_to_pose
     enable_compute_path_check: true
     min_path_poses: 2
-    tf_lookup_timeout_sec: 1.0
+    tf_lookup_timeout_sec: 0.05
+    use_last_pose_on_tf_failure: true
+    max_cached_pose_age_sec: 2.0
     enable_recovery_spin: true
     recovery_spin_duration_sec: 4.0
     recovery_spin_angular_vel: 0.35
@@ -51,9 +53,11 @@ active_slam_node:
     max_goal_distance_m: 5.0
     goal_clearance_radius_m: 0.35
     unknown_clearance_radius_m: 0.10
-    path_clearance_radius_m: 0.35
-    path_unknown_clearance_radius_m: 0.05
+    path_clearance_radius_m: 0.30
+    path_unknown_clearance_radius_m: 0.0
     path_check_stride: 2
+    allow_unknown_path_cells: true
+    allow_uncertain_path_cells: true
     goal_backoff_m: 0.35
     same_goal_tolerance_m: 1.00
 

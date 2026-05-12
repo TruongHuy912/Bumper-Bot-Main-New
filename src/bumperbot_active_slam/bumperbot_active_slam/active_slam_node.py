@@ -74,7 +74,11 @@ class ActiveSlamNode(Node):
         )
 
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.tf_listener = TransformListener(
+            self.tf_buffer,
+            self,
+            spin_thread=True,
+        )
 
         self.nav_client = ActionClient(
             self,
@@ -119,6 +123,8 @@ class ActiveSlamNode(Node):
         self.costmap_recovery_state = 'IDLE'
         self.costmap_recovery_until_sec = 0.0
         self.costmap_recovery_reason = ''
+        self.last_robot_xy: Optional[WorldPoint] = None
+        self.last_robot_pose_time_sec: Optional[float] = None
 
         self.last_sent_goal_xy: Optional[WorldPoint] = None
         self.last_goal_done_time = self.get_clock().now()
@@ -175,7 +181,9 @@ class ActiveSlamNode(Node):
         self.declare_parameter('compute_path_action_name', '/compute_path_to_pose')
         self.declare_parameter('enable_compute_path_check', True)
         self.declare_parameter('min_path_poses', 2)
-        self.declare_parameter('tf_lookup_timeout_sec', 1.0)
+        self.declare_parameter('tf_lookup_timeout_sec', 0.05)
+        self.declare_parameter('use_last_pose_on_tf_failure', True)
+        self.declare_parameter('max_cached_pose_age_sec', 2.0)
         self.declare_parameter('enable_recovery_spin', True)
         self.declare_parameter('recovery_spin_duration_sec', 4.0)
         self.declare_parameter('recovery_spin_angular_vel', 0.35)
@@ -222,9 +230,11 @@ class ActiveSlamNode(Node):
         self.declare_parameter('max_goal_distance_m', 5.0)
         self.declare_parameter('goal_clearance_radius_m', 0.35)
         self.declare_parameter('unknown_clearance_radius_m', 0.10)
-        self.declare_parameter('path_clearance_radius_m', 0.35)
-        self.declare_parameter('path_unknown_clearance_radius_m', 0.05)
+        self.declare_parameter('path_clearance_radius_m', 0.30)
+        self.declare_parameter('path_unknown_clearance_radius_m', 0.0)
         self.declare_parameter('path_check_stride', 2)
+        self.declare_parameter('allow_unknown_path_cells', True)
+        self.declare_parameter('allow_uncertain_path_cells', True)
         self.declare_parameter('goal_backoff_m', 0.35)
         self.declare_parameter('same_goal_tolerance_m', 1.00)
 
@@ -255,6 +265,12 @@ class ActiveSlamNode(Node):
         )
         self.tf_lookup_timeout_sec = float(
             self.get_parameter('tf_lookup_timeout_sec').value
+        )
+        self.use_last_pose_on_tf_failure = bool(
+            self.get_parameter('use_last_pose_on_tf_failure').value
+        )
+        self.max_cached_pose_age_sec = float(
+            self.get_parameter('max_cached_pose_age_sec').value
         )
         self.enable_recovery_spin = bool(
             self.get_parameter('enable_recovery_spin').value
@@ -372,6 +388,12 @@ class ActiveSlamNode(Node):
         )
         self.path_check_stride = int(
             self.get_parameter('path_check_stride').value
+        )
+        self.allow_unknown_path_cells = bool(
+            self.get_parameter('allow_unknown_path_cells').value
+        )
+        self.allow_uncertain_path_cells = bool(
+            self.get_parameter('allow_uncertain_path_cells').value
         )
         self.goal_backoff_m = float(
             self.get_parameter('goal_backoff_m').value
@@ -570,41 +592,48 @@ class ActiveSlamNode(Node):
         timeout = Duration(seconds=self.tf_lookup_timeout_sec)
 
         try:
-            if not self.tf_buffer.can_transform(
-                self.global_frame,
-                self.robot_base_frame,
-                query_time,
-                timeout=timeout,
-            ):
-                self._warn_throttled(
-                    'tf',
-                    'Waiting for TF %s -> %s: can_transform timed out after %.2f sec'
-                    % (
-                        self.global_frame,
-                        self.robot_base_frame,
-                        self.tf_lookup_timeout_sec,
-                    ),
-                )
-                return None
-
             transform = self.tf_buffer.lookup_transform(
                 self.global_frame,
                 self.robot_base_frame,
                 query_time,
-                timeout=Duration(seconds=0.0),
+                timeout=timeout,
             )
         except TransformException as exc:
+            cached_xy = self._get_cached_robot_xy()
+            if cached_xy is not None:
+                self._warn_throttled(
+                    'tf_cached_pose',
+                    'Using cached robot pose because TF lookup failed: %s' % exc,
+                    period_sec=2.0,
+                )
+                return cached_xy
+
             self._warn_throttled(
                 'tf',
                 'Waiting for TF %s -> %s failed: %s. '
-                'Check use_sim_time and ensure map->odom is from SLAM Toolbox, '
-                'and odom->base is published by only one source.'
+                'TF tree exists, so this is likely a listener/timing miss.'
                 % (self.global_frame, self.robot_base_frame, exc),
             )
             return None
 
         translation = transform.transform.translation
-        return translation.x, translation.y
+        robot_xy = (translation.x, translation.y)
+        self.last_robot_xy = robot_xy
+        self.last_robot_pose_time_sec = self._now_seconds()
+        return robot_xy
+
+    def _get_cached_robot_xy(self) -> Optional[WorldPoint]:
+        if not self.use_last_pose_on_tf_failure:
+            return None
+
+        if self.last_robot_xy is None or self.last_robot_pose_time_sec is None:
+            return None
+
+        pose_age_sec = self._now_seconds() - self.last_robot_pose_time_sec
+        if pose_age_sec > self.max_cached_pose_age_sec:
+            return None
+
+        return self.last_robot_xy
 
     def _map_to_numpy(self, msg: OccupancyGrid) -> np.ndarray:
         return np.array(msg.data, dtype=np.int16).reshape(
@@ -1288,7 +1317,19 @@ class ActiveSlamNode(Node):
             if cell is None:
                 return False, 'path_out_of_map'
 
-            if not self._is_free_cell(cell, grid):
+            x_cell, y_cell = cell
+            cell_value = int(grid[y_cell, x_cell])
+
+            if cell_value >= self.occupied_min_value:
+                return False, 'path_occupied'
+
+            if cell_value == self.unknown_value and not self.allow_unknown_path_cells:
+                return False, 'path_unknown'
+
+            if (
+                self.free_max_value < cell_value < self.occupied_min_value
+                and not self.allow_uncertain_path_cells
+            ):
                 return False, 'path_not_free'
 
             if not self._has_occupied_clearance(
@@ -1298,12 +1339,13 @@ class ActiveSlamNode(Node):
             ):
                 return False, 'path_occupied_clearance'
 
-            if not self._has_unknown_clearance(
-                cell,
-                grid,
-                self.path_unknown_clearance_radius_m,
-            ):
-                return False, 'path_unknown_clearance'
+            if self.path_unknown_clearance_radius_m > 0.0:
+                if not self._has_unknown_clearance(
+                    cell,
+                    grid,
+                    self.path_unknown_clearance_radius_m,
+                ):
+                    return False, 'path_unknown_clearance'
 
         return True, 'ok'
 
