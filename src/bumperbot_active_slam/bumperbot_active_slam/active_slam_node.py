@@ -17,6 +17,7 @@ except ImportError:
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, PoseStamped, Twist
 from nav2_msgs.action import ComputePathToPose, NavigateToPose
+from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap
 from nav_msgs.msg import OccupancyGrid
 import rclpy
@@ -79,6 +80,11 @@ class ActiveSlamNode(Node):
             self.cmd_vel_topic,
             10,
         )
+        self.speed_limit_pub = self.create_publisher(
+            SpeedLimit,
+            self.speed_limit_topic,
+            10,
+        )
 
         self.tf_buffer = Buffer()
         try:
@@ -118,10 +124,13 @@ class ActiveSlamNode(Node):
         self.goal_cancel_in_progress = False
         self.current_goal_xy: Optional[WorldPoint] = None
         self.current_goal_handle = None
+        self.nav_goal_sequence = 0
+        self.active_nav_goal_sequence = 0
         self.goal_start_time_sec: Optional[float] = None
         self.path_check_active = False
         self.pending_goal_pose: Optional[PoseStamped] = None
         self.pending_candidate: Optional[FrontierCandidate] = None
+        self.pending_goal_kind = 'frontier'
         self.recovery_spin_until_sec = 0.0
         self.recovery_spin_active = False
         self.last_too_close_recovery_time_sec = 0.0
@@ -129,6 +138,7 @@ class ActiveSlamNode(Node):
         self.path_failure_times: List[float] = []
         self.path_failure_pause_until_sec = 0.0
         self.pending_candidates_queue: List[FrontierCandidate] = []
+        self.pending_candidates_goal_kind = 'frontier'
         self.path_check_attempts_this_cycle = 0
         self.pending_candidate_index = 0
         self.visited_goals: List[Tuple[WorldPoint, float]] = []
@@ -142,11 +152,46 @@ class ActiveSlamNode(Node):
         self.last_robot_pose_time_sec: Optional[float] = None
         self.map_helpers = {}
         self.last_timing_log_time_sec = 0.0
+        self.last_speed_limit_publish_time_sec = 0.0
+        self.last_speed_limit_update_time_sec = self._now_seconds()
+        self.current_speed_limit_mps = 0.0
+        self.current_path_uncertainty = 'known'
+        self.current_goal_is_relay = False
+        self.current_relay_original_goal_xy: Optional[WorldPoint] = None
+        self.current_goal_kind = 'frontier'
+        self.current_goal_cluster_centroid: Optional[WorldPoint] = None
+        self.no_valid_frontier_cycles = 0
+        self.no_frontier_cycles = 0
+        self.last_corner_escape_time_sec = 0.0
+        self.corner_escape_active = False
+        self.nav_progress_ref_xy = None
+        self.nav_progress_ref_time_sec = 0.0
+        self.last_high_cost_escape_time_sec = 0.0
+        self.high_cost_escape_active = False
+        self.high_cost_escape_cancel_pending = False
+        self.high_cost_escape_original_goal_xy: Optional[WorldPoint] = None
+        self.cancel_current_goal_should_blacklist = True
+        self.cancel_current_goal_status = 'GOAL_TIMEOUT_BLACKLISTED'
+        self.local_unstuck_active = False
+        self.local_unstuck_until_sec = 0.0
+        self.last_local_unstuck_time_sec = 0.0
+        self.consecutive_local_unstuck_count = 0
+        self.no_path_candidate_cycles = 0
+        self.local_unstuck_turn_direction = 1.0
+        self.last_blacklist_saturation_recovery_time_sec = 0.0
+        self.recent_region_relax_until_sec = 0.0
+        self.initial_scan_spin_done = False
+        self.initial_scan_spin_until_sec = 0.0
+        self.recent_goal_regions = []
+        self.goal_history: List[WorldPoint] = []
+        self.cluster_visit_counts = {}
 
         self.last_sent_goal_xy: Optional[WorldPoint] = None
         self.last_goal_done_time = self.get_clock().now()
 
         self.blacklisted_goals: List[Tuple[WorldPoint, float]] = []
+        self.no_path_blacklisted_goals: List[Tuple[WorldPoint, float]] = []
+        self.path_safety_blacklisted_goals: List[Tuple[WorldPoint, float]] = []
         self.last_selected_pose: Optional[PoseStamped] = None
         self.last_candidate_rejections = {}
         self._last_warn_time = {}
@@ -196,6 +241,7 @@ class ActiveSlamNode(Node):
         self.declare_parameter('robot_base_frame', 'base_footprint')
         self.declare_parameter('nav2_action_name', '/navigate_to_pose')
         self.declare_parameter('compute_path_action_name', '/compute_path_to_pose')
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel_raw')
         self.declare_parameter('enable_compute_path_check', True)
         self.declare_parameter('min_path_poses', 2)
         self.declare_parameter('tf_lookup_timeout_sec', 0.05)
@@ -207,31 +253,31 @@ class ActiveSlamNode(Node):
         self.declare_parameter('max_consecutive_too_close_spins', 1)
         self.declare_parameter('recovery_spin_duration_sec', 1.5)
         self.declare_parameter('recovery_spin_angular_vel', 0.15)
-        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('too_close_recovery_threshold', 999)
         self.declare_parameter('path_failure_threshold', 3)
         self.declare_parameter('path_failure_window_sec', 30.0)
         self.declare_parameter('path_failure_pause_sec', 0.0)
-        self.declare_parameter('max_path_check_attempts_per_cycle', 3)
-        self.declare_parameter('enable_timing_debug', True)
+        self.declare_parameter('max_path_check_attempts_per_cycle', 12)
+        self.declare_parameter('enable_timing_debug', False)
         self.declare_parameter('timing_log_period_sec', 5.0)
-        self.declare_parameter('max_clusters_to_score', 8)
-        self.declare_parameter('max_seed_cells_per_cluster', 6)
-        self.declare_parameter('max_total_candidates', 40)
+        self.declare_parameter('max_clusters_to_score', 16)
+        self.declare_parameter('max_seed_cells_per_cluster', 8)
+        self.declare_parameter('max_total_candidates', 90)
         self.declare_parameter('adaptive_goal_distance_enabled', True)
-        self.declare_parameter('max_goal_distance_hard_m', 8.0)
-        self.declare_parameter('goal_distance_expand_step_m', 1.0)
-        self.declare_parameter('cluster_distance_weight', 0.7)
-        self.declare_parameter('cluster_size_weight', 0.3)
+        self.declare_parameter('max_goal_distance_hard_m', 15.0)
+        self.declare_parameter('goal_distance_expand_step_m', 2.0)
+        self.declare_parameter('max_goal_distance_expansions', 4)
+        self.declare_parameter('cluster_distance_weight', 0.55)
+        self.declare_parameter('cluster_size_weight', 0.45)
         self.declare_parameter('cluster_distance_sample_count', 20)
-        self.declare_parameter('visited_goal_radius_m', 0.80)
-        self.declare_parameter('visited_goal_duration_sec', 180.0)
+        self.declare_parameter('visited_goal_radius_m', 0.50)
+        self.declare_parameter('visited_goal_duration_sec', 90.0)
         self.declare_parameter('max_visited_goals', 50)
         self.declare_parameter('nav_xy_goal_tolerance_m', 0.20)
-        self.declare_parameter('min_goal_distance_margin_m', 0.25)
+        self.declare_parameter('min_goal_distance_margin_m', 0.20)
         self.declare_parameter('enable_stuck_watchdog', True)
-        self.declare_parameter('stuck_check_radius_m', 0.15)
-        self.declare_parameter('stuck_timeout_sec', 60.0)
+        self.declare_parameter('stuck_check_radius_m', 0.10)
+        self.declare_parameter('stuck_timeout_sec', 35.0)
         self.declare_parameter('enable_costmap_recovery', True)
         self.declare_parameter(
             'clear_global_costmap_service',
@@ -245,10 +291,17 @@ class ActiveSlamNode(Node):
         self.declare_parameter('recovery_backup_linear_vel', -0.03)
         self.declare_parameter('recovery_wait_after_clear_sec', 1.0)
 
-        self.declare_parameter('control_period_sec', 1.0)
-        self.declare_parameter('goal_cooldown_sec', 1.0)
-        self.declare_parameter('blacklist_duration_sec', 45.0)
-        self.declare_parameter('blacklist_radius_m', 0.60)
+        self.declare_parameter('control_period_sec', 0.5)
+        self.declare_parameter('goal_cooldown_sec', 0.3)
+        self.declare_parameter('blacklist_duration_sec', 8.0)
+        self.declare_parameter('blacklist_radius_m', 0.20)
+        self.declare_parameter('no_path_blacklist_duration_sec', 3.0)
+        self.declare_parameter('no_path_blacklist_radius_m', 0.15)
+        self.declare_parameter('path_safety_blacklist_duration_sec', 5.0)
+        self.declare_parameter('path_safety_blacklist_radius_m', 0.20)
+        self.declare_parameter('start_blocked_check_clearance_m', 0.12)
+        self.declare_parameter('count_no_path_as_start_blocked', False)
+        self.declare_parameter('clear_blacklist_after_costmap_recovery', True)
         self.declare_parameter('nav_timeout_sec', 0.0)
         self.declare_parameter('min_free_cells_before_start', 200)
 
@@ -256,18 +309,22 @@ class ActiveSlamNode(Node):
         self.declare_parameter('free_max_value', 25)
         self.declare_parameter('occupied_min_value', 65)
 
-        self.declare_parameter('min_frontier_cells', 20)
-        self.declare_parameter('min_goal_distance_m', 0.60)
-        self.declare_parameter('max_goal_distance_m', 7.0)
-        self.declare_parameter('goal_clearance_radius_m', 0.35)
-        self.declare_parameter('unknown_clearance_radius_m', 0.10)
-        self.declare_parameter('path_clearance_radius_m', 0.30)
+        self.declare_parameter('min_frontier_cells', 10)
+        self.declare_parameter('min_goal_distance_m', 0.40)
+        self.declare_parameter('max_goal_distance_m', 9.0)
+        self.declare_parameter('goal_clearance_radius_m', 0.30)
+        self.declare_parameter('unknown_clearance_radius_m', 0.03)
+        self.declare_parameter('path_clearance_radius_m', 0.25)
+        self.declare_parameter('path_clearance_hard_m', 0.12)
+        self.declare_parameter('path_clearance_soft_m', 0.25)
+        self.declare_parameter('max_path_clearance_violation_ratio', 0.10)
+        self.declare_parameter('max_consecutive_clearance_violations', 5)
         self.declare_parameter('path_unknown_clearance_radius_m', 0.0)
-        self.declare_parameter('path_check_stride', 3)
+        self.declare_parameter('path_check_stride', 5)
         self.declare_parameter('allow_unknown_path_cells', True)
         self.declare_parameter('allow_uncertain_path_cells', True)
-        self.declare_parameter('goal_backoff_m', 0.20)
-        self.declare_parameter('same_goal_tolerance_m', 0.80)
+        self.declare_parameter('goal_backoff_m', 0.0)
+        self.declare_parameter('same_goal_tolerance_m', 0.55)
 
         self.declare_parameter('lambda_distance', 0.15)
         self.declare_parameter('entropy_weight', 1.0)
@@ -276,10 +333,94 @@ class ActiveSlamNode(Node):
         self.declare_parameter('entropy_neighborhood_radius_cells', 1)
 
         self.declare_parameter('publish_markers', True)
-        self.declare_parameter('max_marker_frontier_points', 1500)
+        self.declare_parameter('max_marker_frontier_points', 800)
         self.declare_parameter('marker_topic', '/active_slam/frontiers')
         self.declare_parameter('selected_goal_topic', '/active_slam/selected_goal')
         self.declare_parameter('status_topic', '/active_slam/status')
+
+        self.declare_parameter('enable_adaptive_speed', True)
+        self.declare_parameter('speed_limit_topic', '/speed_limit')
+        self.declare_parameter('speed_limit_percentage', False)
+        self.declare_parameter('known_area_speed_mps', 0.14)
+        self.declare_parameter('mixed_area_speed_mps', 0.11)
+        self.declare_parameter('unknown_area_speed_mps', 0.09)
+        self.declare_parameter('near_obstacle_speed_mps', 0.075)
+        self.declare_parameter('unknown_slowdown_distance_m', 0.50)
+        self.declare_parameter('obstacle_slowdown_distance_m', 0.28)
+        self.declare_parameter('frontier_slowdown_distance_m', 0.60)
+        self.declare_parameter('speed_limit_publish_period_sec', 0.5)
+        self.declare_parameter('restore_full_speed_when_idle', True)
+        self.declare_parameter('max_speed_change_mps_per_sec', 0.15)
+
+        self.declare_parameter('enable_relay_goal_for_far_frontier', True)
+        self.declare_parameter('relay_goal_distance_m', 4.5)
+        self.declare_parameter('relay_goal_min_clearance_m', 0.25)
+        self.declare_parameter('relay_goal_max_search_ahead_m', 6.0)
+
+        self.declare_parameter('enable_corner_escape', True)
+        self.declare_parameter('corner_escape_trigger_cycles', 4)
+        self.declare_parameter('corner_escape_distance_m', 1.0)
+        self.declare_parameter('corner_escape_min_clearance_m', 0.25)
+        self.declare_parameter('corner_escape_max_candidates', 16)
+        self.declare_parameter('corner_escape_cooldown_sec', 10.0)
+        self.declare_parameter('enable_high_cost_escape', True)
+        self.declare_parameter('high_cost_escape_obstacle_dist_m', 0.30)
+        self.declare_parameter('high_cost_escape_unknown_dist_m', 0.30)
+        self.declare_parameter('high_cost_escape_stuck_time_sec', 8.0)
+        self.declare_parameter('high_cost_escape_min_progress_m', 0.08)
+        self.declare_parameter('high_cost_escape_goal_distance_m', 1.0)
+        self.declare_parameter(
+            'high_cost_escape_candidate_radii_m',
+            [0.4, 0.6, 0.8, 1.0, 1.2],
+        )
+        self.declare_parameter('high_cost_escape_min_clearance_m', 0.28)
+        self.declare_parameter('high_cost_escape_max_candidates', 24)
+        self.declare_parameter('high_cost_escape_cooldown_sec', 15.0)
+        self.declare_parameter('enable_local_unstuck_escape', True)
+        self.declare_parameter('local_unstuck_after_high_cost_escape_failed', True)
+        self.declare_parameter('local_unstuck_after_no_path_cycles', 2)
+        self.declare_parameter('local_unstuck_duration_sec', 1.8)
+        self.declare_parameter('local_unstuck_linear_vel', -0.045)
+        self.declare_parameter('local_unstuck_angular_vel', 0.25)
+        self.declare_parameter('local_unstuck_clear_costmap_after', True)
+        self.declare_parameter('local_unstuck_cooldown_sec', 8.0)
+        self.declare_parameter('local_unstuck_max_consecutive', 2)
+        self.declare_parameter('exploration_complete_no_frontier_cycles', 10)
+        self.declare_parameter('exploration_complete_min_frontier_cells', 0)
+
+        self.declare_parameter('enable_blacklist_saturation_recovery', True)
+        self.declare_parameter('blacklist_saturation_ratio', 0.55)
+        self.declare_parameter('blacklist_saturation_min_count', 30)
+        self.declare_parameter('blacklist_saturation_clear_no_path', True)
+        self.declare_parameter('blacklist_saturation_clear_path_safety', False)
+        self.declare_parameter('blacklist_saturation_cooldown_sec', 8.0)
+        self.declare_parameter('enable_recent_region_relaxation', True)
+        self.declare_parameter('recent_region_relaxation_blacklist_threshold', 40)
+        self.declare_parameter('recent_region_relaxation_duration_sec', 10.0)
+
+        self.declare_parameter('enable_anti_ping_pong', True)
+        self.declare_parameter('enable_hard_recent_region_filter', False)
+        self.declare_parameter('enable_hard_ping_pong_filter', False)
+        self.declare_parameter('enable_cluster_cooldown_filter', False)
+        self.declare_parameter('enable_soft_recent_region_penalty', True)
+        self.declare_parameter('recent_goal_region_radius_m', 0.35)
+        self.declare_parameter('recent_goal_region_duration_sec', 20.0)
+        self.declare_parameter('max_recent_goal_regions', 30)
+        self.declare_parameter('cluster_cooldown_radius_m', 0.60)
+        self.declare_parameter('cluster_cooldown_duration_sec', 45.0)
+        self.declare_parameter('ping_pong_detection_enabled', True)
+        self.declare_parameter('ping_pong_history_length', 6)
+        self.declare_parameter('ping_pong_radius_m', 0.45)
+        self.declare_parameter('recent_region_penalty_weight', 0.15)
+        self.declare_parameter('enable_cluster_stagnation_filter', False)
+        self.declare_parameter('cluster_stagnation_radius_m', 1.0)
+        self.declare_parameter('cluster_stagnation_limit', 3)
+        self.declare_parameter('cluster_stagnation_duration_sec', 120.0)
+
+        self.declare_parameter('enable_initial_scan_spin', True)
+        self.declare_parameter('initial_scan_spin_angular_vel', 0.35)
+        self.declare_parameter('initial_scan_spin_duration_sec', 18.0)
+        self.declare_parameter('initial_scan_min_free_cells', 50)
 
     def _read_parameters(self):
         self.map_topic = self.get_parameter('map_topic').value
@@ -362,6 +503,9 @@ class ActiveSlamNode(Node):
         self.goal_distance_expand_step_m = float(
             self.get_parameter('goal_distance_expand_step_m').value
         )
+        self.max_goal_distance_expansions = int(
+            self.get_parameter('max_goal_distance_expansions').value
+        )
         self.cluster_distance_weight = float(
             self.get_parameter('cluster_distance_weight').value
         )
@@ -426,6 +570,27 @@ class ActiveSlamNode(Node):
         self.blacklist_radius_m = float(
             self.get_parameter('blacklist_radius_m').value
         )
+        self.no_path_blacklist_duration_sec = float(
+            self.get_parameter('no_path_blacklist_duration_sec').value
+        )
+        self.no_path_blacklist_radius_m = float(
+            self.get_parameter('no_path_blacklist_radius_m').value
+        )
+        self.path_safety_blacklist_duration_sec = float(
+            self.get_parameter('path_safety_blacklist_duration_sec').value
+        )
+        self.path_safety_blacklist_radius_m = float(
+            self.get_parameter('path_safety_blacklist_radius_m').value
+        )
+        self.start_blocked_check_clearance_m = float(
+            self.get_parameter('start_blocked_check_clearance_m').value
+        )
+        self.count_no_path_as_start_blocked = bool(
+            self.get_parameter('count_no_path_as_start_blocked').value
+        )
+        self.clear_blacklist_after_costmap_recovery = bool(
+            self.get_parameter('clear_blacklist_after_costmap_recovery').value
+        )
         self.nav_timeout_sec = float(
             self.get_parameter('nav_timeout_sec').value
         )
@@ -456,6 +621,18 @@ class ActiveSlamNode(Node):
         )
         self.path_clearance_radius_m = float(
             self.get_parameter('path_clearance_radius_m').value
+        )
+        self.path_clearance_hard_m = float(
+            self.get_parameter('path_clearance_hard_m').value
+        )
+        self.path_clearance_soft_m = float(
+            self.get_parameter('path_clearance_soft_m').value
+        )
+        self.max_path_clearance_violation_ratio = float(
+            self.get_parameter('max_path_clearance_violation_ratio').value
+        )
+        self.max_consecutive_clearance_violations = int(
+            self.get_parameter('max_consecutive_clearance_violations').value
         )
         self.path_unknown_clearance_radius_m = float(
             self.get_parameter('path_unknown_clearance_radius_m').value
@@ -504,6 +681,266 @@ class ActiveSlamNode(Node):
         ).value
         self.status_topic = self.get_parameter('status_topic').value
 
+        self.enable_adaptive_speed = bool(
+            self.get_parameter('enable_adaptive_speed').value
+        )
+        self.speed_limit_topic = self.get_parameter('speed_limit_topic').value
+        self.speed_limit_percentage = bool(
+            self.get_parameter('speed_limit_percentage').value
+        )
+        self.known_area_speed_mps = float(
+            self.get_parameter('known_area_speed_mps').value
+        )
+        self.mixed_area_speed_mps = float(
+            self.get_parameter('mixed_area_speed_mps').value
+        )
+        self.unknown_area_speed_mps = float(
+            self.get_parameter('unknown_area_speed_mps').value
+        )
+        self.near_obstacle_speed_mps = float(
+            self.get_parameter('near_obstacle_speed_mps').value
+        )
+        self.unknown_slowdown_distance_m = float(
+            self.get_parameter('unknown_slowdown_distance_m').value
+        )
+        self.obstacle_slowdown_distance_m = float(
+            self.get_parameter('obstacle_slowdown_distance_m').value
+        )
+        self.frontier_slowdown_distance_m = float(
+            self.get_parameter('frontier_slowdown_distance_m').value
+        )
+        self.speed_limit_publish_period_sec = float(
+            self.get_parameter('speed_limit_publish_period_sec').value
+        )
+        self.restore_full_speed_when_idle = bool(
+            self.get_parameter('restore_full_speed_when_idle').value
+        )
+        self.max_speed_change_mps_per_sec = float(
+            self.get_parameter('max_speed_change_mps_per_sec').value
+        )
+
+        self.enable_relay_goal_for_far_frontier = bool(
+            self.get_parameter('enable_relay_goal_for_far_frontier').value
+        )
+        self.relay_goal_distance_m = float(
+            self.get_parameter('relay_goal_distance_m').value
+        )
+        self.relay_goal_min_clearance_m = float(
+            self.get_parameter('relay_goal_min_clearance_m').value
+        )
+        self.relay_goal_max_search_ahead_m = float(
+            self.get_parameter('relay_goal_max_search_ahead_m').value
+        )
+
+        self.enable_corner_escape = bool(
+            self.get_parameter('enable_corner_escape').value
+        )
+        self.corner_escape_trigger_cycles = int(
+            self.get_parameter('corner_escape_trigger_cycles').value
+        )
+        self.corner_escape_distance_m = float(
+            self.get_parameter('corner_escape_distance_m').value
+        )
+        self.corner_escape_min_clearance_m = float(
+            self.get_parameter('corner_escape_min_clearance_m').value
+        )
+        self.corner_escape_max_candidates = int(
+            self.get_parameter('corner_escape_max_candidates').value
+        )
+        self.corner_escape_cooldown_sec = float(
+            self.get_parameter('corner_escape_cooldown_sec').value
+        )
+        self.enable_high_cost_escape = bool(
+            self.get_parameter('enable_high_cost_escape').value
+        )
+        self.high_cost_escape_obstacle_dist_m = float(
+            self.get_parameter('high_cost_escape_obstacle_dist_m').value
+        )
+        self.high_cost_escape_unknown_dist_m = float(
+            self.get_parameter('high_cost_escape_unknown_dist_m').value
+        )
+        self.high_cost_escape_stuck_time_sec = float(
+            self.get_parameter('high_cost_escape_stuck_time_sec').value
+        )
+        self.high_cost_escape_min_progress_m = float(
+            self.get_parameter('high_cost_escape_min_progress_m').value
+        )
+        self.high_cost_escape_goal_distance_m = float(
+            self.get_parameter('high_cost_escape_goal_distance_m').value
+        )
+        self.high_cost_escape_candidate_radii_m = (
+            self._read_float_list_parameter(
+                'high_cost_escape_candidate_radii_m',
+                [0.4, 0.6, 0.8, 1.0, 1.2],
+            )
+        )
+        self.high_cost_escape_min_clearance_m = float(
+            self.get_parameter('high_cost_escape_min_clearance_m').value
+        )
+        self.high_cost_escape_max_candidates = int(
+            self.get_parameter('high_cost_escape_max_candidates').value
+        )
+        self.high_cost_escape_cooldown_sec = float(
+            self.get_parameter('high_cost_escape_cooldown_sec').value
+        )
+        self.enable_local_unstuck_escape = bool(
+            self.get_parameter('enable_local_unstuck_escape').value
+        )
+        self.local_unstuck_after_high_cost_escape_failed = bool(
+            self.get_parameter(
+                'local_unstuck_after_high_cost_escape_failed'
+            ).value
+        )
+        self.local_unstuck_after_no_path_cycles = int(
+            self.get_parameter('local_unstuck_after_no_path_cycles').value
+        )
+        self.local_unstuck_duration_sec = float(
+            self.get_parameter('local_unstuck_duration_sec').value
+        )
+        self.local_unstuck_linear_vel = float(
+            self.get_parameter('local_unstuck_linear_vel').value
+        )
+        self.local_unstuck_angular_vel = float(
+            self.get_parameter('local_unstuck_angular_vel').value
+        )
+        self.local_unstuck_clear_costmap_after = bool(
+            self.get_parameter('local_unstuck_clear_costmap_after').value
+        )
+        self.local_unstuck_cooldown_sec = float(
+            self.get_parameter('local_unstuck_cooldown_sec').value
+        )
+        self.local_unstuck_max_consecutive = int(
+            self.get_parameter('local_unstuck_max_consecutive').value
+        )
+        self.exploration_complete_no_frontier_cycles = int(
+            self.get_parameter('exploration_complete_no_frontier_cycles').value
+        )
+        self.exploration_complete_min_frontier_cells = int(
+            self.get_parameter('exploration_complete_min_frontier_cells').value
+        )
+        self.enable_blacklist_saturation_recovery = bool(
+            self.get_parameter('enable_blacklist_saturation_recovery').value
+        )
+        self.blacklist_saturation_ratio = float(
+            self.get_parameter('blacklist_saturation_ratio').value
+        )
+        self.blacklist_saturation_min_count = int(
+            self.get_parameter('blacklist_saturation_min_count').value
+        )
+        self.blacklist_saturation_clear_no_path = bool(
+            self.get_parameter('blacklist_saturation_clear_no_path').value
+        )
+        self.blacklist_saturation_clear_path_safety = bool(
+            self.get_parameter('blacklist_saturation_clear_path_safety').value
+        )
+        self.blacklist_saturation_cooldown_sec = float(
+            self.get_parameter('blacklist_saturation_cooldown_sec').value
+        )
+        self.enable_recent_region_relaxation = bool(
+            self.get_parameter('enable_recent_region_relaxation').value
+        )
+        self.recent_region_relaxation_blacklist_threshold = int(
+            self.get_parameter(
+                'recent_region_relaxation_blacklist_threshold'
+            ).value
+        )
+        self.recent_region_relaxation_duration_sec = float(
+            self.get_parameter('recent_region_relaxation_duration_sec').value
+        )
+        self.enable_anti_ping_pong = bool(
+            self.get_parameter('enable_anti_ping_pong').value
+        )
+        self.enable_hard_recent_region_filter = bool(
+            self.get_parameter('enable_hard_recent_region_filter').value
+        )
+        self.enable_hard_ping_pong_filter = bool(
+            self.get_parameter('enable_hard_ping_pong_filter').value
+        )
+        self.enable_cluster_cooldown_filter = bool(
+            self.get_parameter('enable_cluster_cooldown_filter').value
+        )
+        self.enable_soft_recent_region_penalty = bool(
+            self.get_parameter('enable_soft_recent_region_penalty').value
+        )
+        self.recent_goal_region_radius_m = float(
+            self.get_parameter('recent_goal_region_radius_m').value
+        )
+        self.recent_goal_region_duration_sec = float(
+            self.get_parameter('recent_goal_region_duration_sec').value
+        )
+        self.max_recent_goal_regions = int(
+            self.get_parameter('max_recent_goal_regions').value
+        )
+        self.cluster_cooldown_radius_m = float(
+            self.get_parameter('cluster_cooldown_radius_m').value
+        )
+        self.cluster_cooldown_duration_sec = float(
+            self.get_parameter('cluster_cooldown_duration_sec').value
+        )
+        self.ping_pong_detection_enabled = bool(
+            self.get_parameter('ping_pong_detection_enabled').value
+        )
+        self.ping_pong_history_length = int(
+            self.get_parameter('ping_pong_history_length').value
+        )
+        self.ping_pong_radius_m = float(
+            self.get_parameter('ping_pong_radius_m').value
+        )
+        self.recent_region_penalty_weight = float(
+            self.get_parameter('recent_region_penalty_weight').value
+        )
+        self.enable_cluster_stagnation_filter = bool(
+            self.get_parameter('enable_cluster_stagnation_filter').value
+        )
+        self.cluster_stagnation_radius_m = float(
+            self.get_parameter('cluster_stagnation_radius_m').value
+        )
+        self.cluster_stagnation_limit = int(
+            self.get_parameter('cluster_stagnation_limit').value
+        )
+        self.cluster_stagnation_duration_sec = float(
+            self.get_parameter('cluster_stagnation_duration_sec').value
+        )
+        self.enable_initial_scan_spin = bool(
+            self.get_parameter('enable_initial_scan_spin').value
+        )
+        self.initial_scan_spin_angular_vel = float(
+            self.get_parameter('initial_scan_spin_angular_vel').value
+        )
+        self.initial_scan_spin_duration_sec = float(
+            self.get_parameter('initial_scan_spin_duration_sec').value
+        )
+        self.initial_scan_min_free_cells = int(
+            self.get_parameter('initial_scan_min_free_cells').value
+        )
+
+    def _read_float_list_parameter(
+        self,
+        name: str,
+        fallback: Sequence[float],
+    ) -> List[float]:
+        try:
+            values = self.get_parameter(name).value
+        except Exception:
+            values = fallback
+
+        if values is None:
+            values = fallback
+
+        radii = []
+        for value in values:
+            try:
+                radius = float(value)
+            except (TypeError, ValueError):
+                continue
+            if radius > 0.0:
+                radii.append(radius)
+
+        if not radii:
+            radii = [float(value) for value in fallback]
+
+        return radii
+
     def _map_callback(self, msg: OccupancyGrid):
         self.map_msg = msg
 
@@ -522,6 +959,11 @@ class ActiveSlamNode(Node):
             self._publish_status('WAITING_FOR_TF')
             return
 
+        if self._process_local_unstuck_escape():
+            return
+
+        self._update_adaptive_speed(robot_xy)
+
         if self._process_costmap_recovery():
             return
 
@@ -539,6 +981,9 @@ class ActiveSlamNode(Node):
             self.recovery_spin_active = False
 
         if self.goal_active:
+            if self._maybe_trigger_high_cost_escape(robot_xy):
+                return
+
             if self._nav_timeout_elapsed():
                 if not self.goal_cancel_in_progress:
                     self._publish_status('GOAL_TIMEOUT_CANCELING')
@@ -559,7 +1004,10 @@ class ActiveSlamNode(Node):
             return
 
         if self.path_check_active:
-            self._publish_status('CHECKING_PATH')
+            if self.pending_goal_kind == 'high_cost_escape':
+                self._publish_status('HIGH_COST_ESCAPE_CHECKING_PATH')
+            else:
+                self._publish_status('CHECKING_PATH')
             return
 
         if self._path_failure_pause_active():
@@ -584,6 +1032,17 @@ class ActiveSlamNode(Node):
             for xy, expires_at in self.blacklisted_goals
             if expires_at > now_sec
         ]
+        self.no_path_blacklisted_goals = [
+            (xy, expires_at)
+            for xy, expires_at in self.no_path_blacklisted_goals
+            if expires_at > now_sec
+        ]
+        self.path_safety_blacklisted_goals = [
+            (xy, expires_at)
+            for xy, expires_at in self.path_safety_blacklisted_goals
+            if expires_at > now_sec
+        ]
+        self._prune_recent_goal_regions()
 
         timings = {}
         total_start = time.perf_counter()
@@ -597,6 +1056,9 @@ class ActiveSlamNode(Node):
         timings['precompute'] = self._elapsed_ms(step_start)
 
         free_cells = int(np.sum((grid >= 0) & (grid <= self.free_max_value)))
+        if self._process_initial_scan_spin(free_cells):
+            return
+
         if free_cells < self.min_free_cells_before_start:
             self._publish_status(
                 'WAITING_FOR_LARGER_MAP free_cells=%d' % free_cells
@@ -646,6 +1108,13 @@ class ActiveSlamNode(Node):
             timings['markers'] = 0.0
 
         if not clusters:
+            self.no_frontier_cycles += 1
+            if (
+                self.no_frontier_cycles
+                >= self.exploration_complete_no_frontier_cycles
+            ):
+                self._publish_status('EXPLORATION_COMPLETE')
+                return
             timings['sort'] = 0.0
             timings['start_checks'] = 0.0
             timings['total'] = self._elapsed_ms(total_start)
@@ -653,12 +1122,23 @@ class ActiveSlamNode(Node):
             self._publish_status('NO_FRONTIER_FOUND')
             return
 
+        self.no_frontier_cycles = 0
+
         if not candidates:
+            self.no_valid_frontier_cycles += 1
             timings['sort'] = 0.0
             timings['start_checks'] = 0.0
             timings['total'] = self._elapsed_ms(total_start)
             self._maybe_log_goal_timing(timings, len(clusters), len(candidates))
             rejection_summary = self._format_rejections()
+            self._maybe_relax_recent_region_filter()
+            if self._maybe_recover_from_blacklist_saturation():
+                self.last_goal_done_time = self.get_clock().now()
+                return
+
+            if self._try_send_corner_escape_goal(robot_xy, grid):
+                return
+
             if self._should_start_recovery_spin('too_close_frontier'):
                 self._publish_status(
                     'NO_VALID_FRONTIER clusters=%d %s'
@@ -672,6 +1152,14 @@ class ActiveSlamNode(Node):
                     'frontiers_too_far',
                     'All valid frontiers are farther than max_goal_distance_m; '
                     'consider increasing max_goal_distance_m.',
+                    period_sec=10.0,
+                )
+
+            if self._unsafe_unknown_rejections_dominate():
+                self._warn_throttled(
+                    'frontiers_unknown_clearance',
+                    'Frontiers rejected by unknown clearance; consider lowering '
+                    'unknown_clearance_radius_m.',
                     period_sec=10.0,
                 )
 
@@ -699,6 +1187,8 @@ class ActiveSlamNode(Node):
         if len(candidates) > self.max_total_candidates:
             candidates = candidates[:self.max_total_candidates]
         self.consecutive_too_close_spins = 0
+        self.no_valid_frontier_cycles = 0
+        self.no_frontier_cycles = 0
         timings['sort'] = self._elapsed_ms(step_start)
         self._log_top_candidates(candidates)
 
@@ -780,10 +1270,314 @@ class ActiveSlamNode(Node):
 
         return self.last_robot_xy
 
+    def _update_adaptive_speed(self, robot_xy: WorldPoint):
+        if not self.enable_adaptive_speed:
+            return
+
+        now_sec = self._now_seconds()
+        if (
+            now_sec - self.last_speed_limit_publish_time_sec
+            < self.speed_limit_publish_period_sec
+        ):
+            return
+
+        if not self.goal_active and self.restore_full_speed_when_idle:
+            self._publish_speed_limit(0.0)
+            self.current_speed_limit_mps = 0.0
+            self.last_speed_limit_update_time_sec = now_sec
+            return
+
+        speed_mps = self._compute_adaptive_speed_limit(
+            robot_xy,
+            self.current_goal_xy,
+        )
+        self._publish_speed_limit(speed_mps)
+
+    def _compute_adaptive_speed_limit(
+        self,
+        robot_xy: WorldPoint,
+        current_goal_xy: Optional[WorldPoint] = None,
+    ) -> float:
+        obstacle_dist = float('inf')
+        unknown_dist = float('inf')
+
+        if self.map_msg is not None:
+            grid = self._map_to_numpy(self.map_msg)
+            speed_helpers = self._precompute_map_helpers(grid)
+            robot_cell = self._world_to_map(robot_xy[0], robot_xy[1], self.map_msg)
+            if robot_cell is not None:
+                x, y = robot_cell
+                obstacle_dist_grid = speed_helpers.get('occupied_distance_m')
+                unknown_dist_grid = speed_helpers.get('unknown_distance_m')
+                if obstacle_dist_grid is not None:
+                    obstacle_dist = float(obstacle_dist_grid[y, x])
+                if unknown_dist_grid is not None:
+                    unknown_dist = float(unknown_dist_grid[y, x])
+
+        if obstacle_dist < self.obstacle_slowdown_distance_m:
+            local_speed = self.near_obstacle_speed_mps
+        elif unknown_dist < self.unknown_slowdown_distance_m:
+            local_speed = self.unknown_area_speed_mps
+        else:
+            local_speed = self.known_area_speed_mps
+
+        if self.current_path_uncertainty == 'unknown':
+            path_speed = self.unknown_area_speed_mps
+        elif self.current_path_uncertainty == 'mixed':
+            path_speed = self.mixed_area_speed_mps
+        else:
+            path_speed = self.known_area_speed_mps
+
+        speed = min(local_speed, path_speed)
+        if current_goal_xy is not None:
+            goal_distance = self._distance(robot_xy, current_goal_xy)
+            if goal_distance < self.frontier_slowdown_distance_m:
+                speed = min(speed, self.mixed_area_speed_mps)
+
+        speed = min(max(speed, self.near_obstacle_speed_mps), self.known_area_speed_mps)
+        now_sec = self._now_seconds()
+        dt = max(0.0, now_sec - self.last_speed_limit_update_time_sec)
+        max_delta = self.max_speed_change_mps_per_sec * dt
+        if self.current_speed_limit_mps > 0.0 and max_delta > 0.0:
+            delta = speed - self.current_speed_limit_mps
+            delta = min(max(delta, -max_delta), max_delta)
+            speed = self.current_speed_limit_mps + delta
+
+        self.current_speed_limit_mps = speed
+        self.last_speed_limit_update_time_sec = now_sec
+        self._warn_throttled(
+            'adaptive_speed',
+            'Adaptive speed: speed=%.2f obstacle_dist=%.2f unknown_dist=%.2f path_uncertainty=%s'
+            % (speed, obstacle_dist, unknown_dist, self.current_path_uncertainty),
+            period_sec=2.0,
+        )
+        return speed
+
+    def _publish_speed_limit(self, speed_mps: float):
+        msg = SpeedLimit()
+        if hasattr(msg, 'header'):
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = self.global_frame
+        msg.percentage = self.speed_limit_percentage
+        msg.speed_limit = float(speed_mps)
+        self.speed_limit_pub.publish(msg)
+        self.last_speed_limit_publish_time_sec = self._now_seconds()
+        if self.speed_limit_pub.get_subscription_count() == 0:
+            self._warn_throttled(
+                'speed_limit_subscribers',
+                'Publishing speed limits on %s, but no subscribers are connected yet.'
+                % self.speed_limit_topic,
+                period_sec=10.0,
+            )
+
+    def _robot_clearance_distances(
+        self,
+        robot_xy: WorldPoint,
+        grid: Optional[np.ndarray] = None,
+        map_helpers: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Tuple[float, float]:
+        if self.map_msg is None:
+            return float('inf'), float('inf')
+
+        if grid is None:
+            grid = self._map_to_numpy(self.map_msg)
+        if map_helpers is None:
+            map_helpers = self._precompute_map_helpers(grid)
+
+        robot_cell = self._world_to_map(robot_xy[0], robot_xy[1], self.map_msg)
+        if robot_cell is None:
+            return float('inf'), float('inf')
+
+        x, y = robot_cell
+        occupied_distance = map_helpers.get('occupied_distance_m')
+        unknown_distance = map_helpers.get('unknown_distance_m')
+        obstacle_dist = (
+            float(occupied_distance[y, x])
+            if occupied_distance is not None
+            else float('inf')
+        )
+        unknown_dist = (
+            float(unknown_distance[y, x])
+            if unknown_distance is not None
+            else float('inf')
+        )
+        return obstacle_dist, unknown_dist
+
+    def _maybe_trigger_high_cost_escape(self, robot_xy: WorldPoint) -> bool:
+        if not self.enable_high_cost_escape:
+            return False
+
+        if not self.goal_active:
+            return False
+
+        if self.high_cost_escape_cancel_pending:
+            self._publish_status('HIGH_COST_ESCAPE_TRIGGERED')
+            return True
+
+        if self.goal_cancel_in_progress:
+            return False
+
+        if self.path_check_active:
+            return False
+
+        if self.current_goal_kind in ('high_cost_escape', 'corner_escape'):
+            return False
+
+        now_sec = self._now_seconds()
+        if (
+            now_sec - self.last_high_cost_escape_time_sec
+            < self.high_cost_escape_cooldown_sec
+        ):
+            return False
+
+        if self.nav_progress_ref_xy is None:
+            self.nav_progress_ref_xy = robot_xy
+            self.nav_progress_ref_time_sec = now_sec
+            return False
+
+        moved = self._distance(robot_xy, self.nav_progress_ref_xy)
+        if moved >= self.high_cost_escape_min_progress_m:
+            self.nav_progress_ref_xy = robot_xy
+            self.nav_progress_ref_time_sec = now_sec
+            return False
+
+        stuck_time_sec = now_sec - self.nav_progress_ref_time_sec
+        if stuck_time_sec < self.high_cost_escape_stuck_time_sec:
+            return False
+
+        if self.map_msg is None:
+            return False
+
+        grid = self._map_to_numpy(self.map_msg)
+        self.map_helpers = self._precompute_map_helpers(grid)
+        obstacle_dist, unknown_dist = self._robot_clearance_distances(
+            robot_xy,
+            grid,
+            self.map_helpers,
+        )
+
+        high_cost_trap = (
+            obstacle_dist < self.high_cost_escape_obstacle_dist_m
+            or unknown_dist < self.high_cost_escape_unknown_dist_m
+        )
+        if not high_cost_trap:
+            return False
+
+        self.get_logger().warn(
+            'High-cost trap detected: obstacle_dist=%.2f, unknown_dist=%.2f, '
+            'moved=%.3f, stuck_time=%.1f'
+            % (obstacle_dist, unknown_dist, moved, stuck_time_sec)
+        )
+        self._publish_status('HIGH_COST_ESCAPE_TRIGGERED')
+
+        self.last_high_cost_escape_time_sec = now_sec
+        self.high_cost_escape_active = True
+        self.high_cost_escape_cancel_pending = True
+        self.high_cost_escape_original_goal_xy = self.current_goal_xy
+        self.run_recovery_after_cancel = False
+        self._cancel_current_goal(
+            blacklist_on_cancel=False,
+            cancel_status='HIGH_COST_ESCAPE_TRIGGERED',
+        )
+        return True
+
+    def _should_try_high_cost_escape_after_nav_failure(self) -> bool:
+        if not self.enable_high_cost_escape:
+            return False
+
+        if self.current_goal_kind in ('high_cost_escape', 'corner_escape'):
+            return False
+
+        if self.path_check_active:
+            return False
+
+        if self.map_msg is None:
+            return False
+
+        now_sec = self._now_seconds()
+        if (
+            now_sec - self.last_high_cost_escape_time_sec
+            < self.high_cost_escape_cooldown_sec
+        ):
+            return False
+
+        robot_xy = self._lookup_robot_xy()
+        if robot_xy is None or self.nav_progress_ref_xy is None:
+            return False
+
+        moved = self._distance(robot_xy, self.nav_progress_ref_xy)
+        stuck_time_sec = now_sec - self.nav_progress_ref_time_sec
+        if (
+            moved >= self.high_cost_escape_min_progress_m
+            or stuck_time_sec < self.high_cost_escape_stuck_time_sec
+        ):
+            return False
+
+        grid = self._map_to_numpy(self.map_msg)
+        self.map_helpers = self._precompute_map_helpers(grid)
+        obstacle_dist, unknown_dist = self._robot_clearance_distances(
+            robot_xy,
+            grid,
+            self.map_helpers,
+        )
+        high_cost_trap = (
+            obstacle_dist < self.high_cost_escape_obstacle_dist_m
+            or unknown_dist < self.high_cost_escape_unknown_dist_m
+        )
+        if not high_cost_trap:
+            return False
+
+        self.get_logger().warn(
+            'Nav2 failed while robot appears in high-cost trap: '
+            'obstacle_dist=%.2f, unknown_dist=%.2f, moved=%.3f, stuck_time=%.1f'
+            % (obstacle_dist, unknown_dist, moved, stuck_time_sec)
+        )
+        return True
+
     def _map_to_numpy(self, msg: OccupancyGrid) -> np.ndarray:
         return np.array(msg.data, dtype=np.int16).reshape(
             (msg.info.height, msg.info.width)
         )
+
+    def _process_initial_scan_spin(self, free_cells: int) -> bool:
+        if not self.enable_initial_scan_spin or self.initial_scan_spin_done:
+            return False
+
+        if self.goal_active or self.path_check_active:
+            return False
+
+        if free_cells < self.initial_scan_min_free_cells:
+            self._publish_status('INITIAL_SCAN_WAITING_FOR_MAP')
+            return True
+
+        now_sec = self._now_seconds()
+        if self.initial_scan_spin_until_sec <= 0.0:
+            self.initial_scan_spin_until_sec = (
+                now_sec + self.initial_scan_spin_duration_sec
+            )
+            self._publish_status('INITIAL_SCAN_SPIN_STARTED')
+            self.get_logger().info(
+                'Initial scan spin started for %.1f sec at %.2f rad/s'
+                % (
+                    self.initial_scan_spin_duration_sec,
+                    self.initial_scan_spin_angular_vel,
+                )
+            )
+
+        if now_sec < self.initial_scan_spin_until_sec:
+            twist = Twist()
+            twist.angular.z = self.initial_scan_spin_angular_vel
+            self.cmd_vel_pub.publish(twist)
+            self._publish_status('INITIAL_SCAN_SPINNING')
+            return True
+
+        self._publish_zero_cmd_vel()
+        self.initial_scan_spin_done = True
+        self.initial_scan_spin_until_sec = 0.0
+        self._publish_status('INITIAL_SCAN_DONE')
+        self.get_logger().info('Initial scan spin done')
+        self.last_goal_done_time = self.get_clock().now()
+        return True
 
     def _elapsed_ms(self, start_time: float) -> float:
         return (time.perf_counter() - start_time) * 1000.0
@@ -1014,6 +1808,9 @@ class ActiveSlamNode(Node):
             'unsafe_unknown': 0,
             'blacklisted': 0,
             'visited': 0,
+            'recent_region': 0,
+            'ping_pong': 0,
+            'stagnant_cluster': 0,
             'no_path': 0,
             'no_entropy': 0,
             'duplicate': 0,
@@ -1022,7 +1819,7 @@ class ActiveSlamNode(Node):
         effective_min_distance = self._effective_min_goal_distance()
 
         for cluster in clusters:
-            for representative_cell in self._cluster_seed_cells(cluster):
+            for representative_cell in self._cluster_seed_cells(cluster, robot_xy):
                 representative_xy = self._map_to_world(
                     representative_cell[0],
                     representative_cell[1],
@@ -1047,6 +1844,25 @@ class ActiveSlamNode(Node):
                 if self._is_visited_goal(backed_xy):
                     rejections['visited'] += 1
                     continue
+                if self.enable_anti_ping_pong:
+                    recent_reason = self._recent_goal_region_match(backed_xy)
+                    if recent_reason is not None:
+                        if (
+                            recent_reason == 'stagnant_cluster'
+                            and self.enable_cluster_stagnation_filter
+                        ):
+                            rejections['stagnant_cluster'] += 1
+                            continue
+                        elif (
+                            recent_reason == 'cluster_cooldown'
+                            and not self.enable_cluster_cooldown_filter
+                        ):
+                            pass
+                        elif self.enable_hard_recent_region_filter:
+                            rejections['recent_region'] += 1
+                            continue
+                        else:
+                            pass
 
                 backed_cell = self._world_to_map(
                     backed_xy[0],
@@ -1096,6 +1912,48 @@ class ActiveSlamNode(Node):
                     rejections['visited'] += 1
                     continue
 
+                if self.enable_anti_ping_pong:
+                    recent_reason = self._recent_goal_region_match(goal_xy)
+                    if recent_reason is not None:
+                        if (
+                            recent_reason == 'stagnant_cluster'
+                            and self.enable_cluster_stagnation_filter
+                        ):
+                            rejections['stagnant_cluster'] += 1
+                            continue
+                        if (
+                            recent_reason == 'cluster_cooldown'
+                            and not self.enable_cluster_cooldown_filter
+                        ):
+                            pass
+                        elif self.enable_hard_recent_region_filter:
+                            rejections['recent_region'] += 1
+                            self._warn_throttled(
+                                'reject_recent_region',
+                                'Rejecting candidate because it is inside recent goal region: '
+                                'goal=(%.2f,%.2f), reason=%s'
+                                % (goal_xy[0], goal_xy[1], recent_reason),
+                                period_sec=3.0,
+                            )
+                            continue
+                        else:
+                            pass
+
+                    if self._detect_ping_pong_candidate(goal_xy):
+                        if self.enable_hard_ping_pong_filter:
+                            rejections['ping_pong'] += 1
+                            self._add_recent_goal_region(
+                                goal_xy,
+                                self.recent_goal_region_radius_m,
+                                self.recent_goal_region_duration_sec,
+                                'ping_pong',
+                            )
+                            self.get_logger().warn(
+                                'Ping-pong detected: rejecting candidate goal=(%.2f,%.2f)'
+                                % (goal_xy[0], goal_xy[1])
+                            )
+                            continue
+
                 path_cells = self._bresenham(
                     robot_cell[0],
                     robot_cell[1],
@@ -1118,6 +1976,8 @@ class ActiveSlamNode(Node):
                     self.entropy_weight * path_entropy * distance_score
                     + self.frontier_size_weight * size_score
                 )
+                if self.enable_soft_recent_region_penalty:
+                    utility *= (1.0 - self._recent_region_penalty(goal_xy))
 
                 candidates.append(
                     FrontierCandidate(
@@ -1151,7 +2011,7 @@ class ActiveSlamNode(Node):
         current_max_distance_m = self.max_goal_distance_m
         hard_limit_m = max(self.max_goal_distance_m, self.max_goal_distance_hard_m)
 
-        for _ in range(3):
+        for _ in range(max(0, self.max_goal_distance_expansions)):
             if current_max_distance_m >= hard_limit_m:
                 break
 
@@ -1178,20 +2038,51 @@ class ActiveSlamNode(Node):
 
         return candidates
 
-    def _cluster_seed_cells(self, cluster: Sequence[GridCell]) -> List[GridCell]:
+    def _cluster_seed_cells(
+        self,
+        cluster: Sequence[GridCell],
+        robot_xy: Optional[WorldPoint] = None,
+    ) -> List[GridCell]:
         centroid_x = sum(cell[0] for cell in cluster) / len(cluster)
         centroid_y = sum(cell[1] for cell in cluster) / len(cluster)
+        max_seeds = max(1, self.max_seed_cells_per_cluster)
+        selected = []
 
-        sorted_cells = sorted(
+        if robot_xy is not None:
+            by_robot = sorted(
+                cluster,
+                key=lambda cell: self._distance(
+                    self._map_to_world(cell[0], cell[1], self.map_msg),
+                    robot_xy,
+                ),
+            )
+            selected.extend(by_robot[: max(1, max_seeds // 2)])
+
+        by_centroid = sorted(
             cluster,
             key=lambda cell: (
                 (cell[0] - centroid_x) ** 2
                 + (cell[1] - centroid_y) ** 2
             ),
         )
+        selected.extend(by_centroid[: max(1, max_seeds // 4)])
 
-        max_seeds = max(1, self.max_seed_cells_per_cluster)
-        return list(sorted_cells[:max_seeds])
+        if len(cluster) > 1:
+            sample_count = max(1, max_seeds - len(selected))
+            step = max(1, len(cluster) // sample_count)
+            selected.extend(cluster[::step][:sample_count])
+
+        unique = []
+        seen = set()
+        for cell in selected:
+            if cell in seen:
+                continue
+            seen.add(cell)
+            unique.append(cell)
+            if len(unique) >= max_seeds:
+                break
+
+        return unique
 
     def _backoff_goal(
         self,
@@ -1467,6 +2358,18 @@ class ActiveSlamNode(Node):
         if self._is_visited_goal(candidate.goal_xy):
             return False
 
+        if (
+            self.enable_hard_recent_region_filter
+            and self._is_in_recent_goal_region(candidate.goal_xy)
+        ):
+            return False
+
+        if (
+            self.enable_hard_ping_pong_filter
+            and self._detect_ping_pong_candidate(candidate.goal_xy)
+        ):
+            return False
+
         if self.last_sent_goal_xy is None:
             return True
 
@@ -1495,21 +2398,160 @@ class ActiveSlamNode(Node):
             for visited_xy, _ in self.visited_goals
         )
 
+    def _add_recent_goal_region(
+        self,
+        xy: WorldPoint,
+        radius_m: float,
+        duration_sec: float,
+        reason: str,
+    ):
+        if not self.enable_anti_ping_pong:
+            return
+
+        expires_at = self._now_seconds() + duration_sec
+        self.recent_goal_regions.append((xy, radius_m, expires_at, reason))
+        if len(self.recent_goal_regions) > self.max_recent_goal_regions:
+            self.recent_goal_regions = self.recent_goal_regions[
+                -self.max_recent_goal_regions:
+            ]
+
+    def _prune_recent_goal_regions(self):
+        now_sec = self._now_seconds()
+        self.recent_goal_regions = [
+            (xy, radius_m, expires_at, reason)
+            for xy, radius_m, expires_at, reason in self.recent_goal_regions
+            if expires_at > now_sec
+        ]
+
+    def _recent_goal_region_match(self, goal_xy: WorldPoint) -> Optional[str]:
+        if not self.enable_anti_ping_pong:
+            return None
+
+        if self._now_seconds() < self.recent_region_relax_until_sec:
+            return None
+
+        self._prune_recent_goal_regions()
+        for region_xy, radius_m, _, reason in self.recent_goal_regions:
+            if self._distance(goal_xy, region_xy) < radius_m:
+                return reason
+
+        return None
+
+    def _is_in_recent_goal_region(self, goal_xy: WorldPoint) -> bool:
+        return self._recent_goal_region_match(goal_xy) is not None
+
+    def _recent_region_penalty(self, goal_xy: WorldPoint) -> float:
+        if not self.enable_anti_ping_pong:
+            return 0.0
+
+        if self._now_seconds() < self.recent_region_relax_until_sec:
+            return 0.0
+
+        self._prune_recent_goal_regions()
+        max_penalty = max(0.0, min(self.recent_region_penalty_weight, 1.0))
+        penalty = 0.0
+        for region_xy, radius_m, _, _ in self.recent_goal_regions:
+            distance_m = self._distance(goal_xy, region_xy)
+            if distance_m <= radius_m:
+                return max_penalty
+
+            influence_radius_m = radius_m * 2.0
+            if distance_m < influence_radius_m:
+                ratio = 1.0 - (
+                    (distance_m - radius_m) / max(radius_m, 1e-6)
+                )
+                penalty = max(penalty, max_penalty * ratio)
+
+        return min(max(penalty, 0.0), max_penalty)
+
+    def _detect_ping_pong_candidate(self, candidate_xy: WorldPoint) -> bool:
+        if not self.enable_anti_ping_pong or not self.ping_pong_detection_enabled:
+            return False
+
+        if len(self.goal_history) < 3:
+            return False
+
+        return (
+            self._distance(candidate_xy, self.goal_history[-2])
+            < self.ping_pong_radius_m
+        )
+
+    def _cluster_centroid_xy(
+        self,
+        cluster: Sequence[GridCell],
+    ) -> Optional[WorldPoint]:
+        if not cluster or self.map_msg is None:
+            return None
+
+        centroid_x = sum(cell[0] for cell in cluster) / len(cluster)
+        centroid_y = sum(cell[1] for cell in cluster) / len(cluster)
+        return self._map_to_world(int(round(centroid_x)), int(round(centroid_y)), self.map_msg)
+
+    def _record_cluster_selection(self, cluster: Sequence[GridCell]):
+        if not self.enable_cluster_stagnation_filter:
+            return
+
+        centroid_xy = self._cluster_centroid_xy(cluster)
+        if centroid_xy is None:
+            return
+
+        now_sec = self._now_seconds()
+        matched_key = None
+        matched_count = 0
+        for key, (stored_xy, count, expires_at) in list(self.cluster_visit_counts.items()):
+            if expires_at <= now_sec:
+                del self.cluster_visit_counts[key]
+                continue
+            if self._distance(centroid_xy, stored_xy) < self.cluster_stagnation_radius_m:
+                matched_key = key
+                matched_count = count
+                break
+
+        if matched_key is None:
+            matched_key = '%.2f:%.2f' % (centroid_xy[0], centroid_xy[1])
+
+        count = matched_count + 1
+        expires_at = now_sec + self.cluster_stagnation_duration_sec
+        self.cluster_visit_counts[matched_key] = (centroid_xy, count, expires_at)
+
+        if count >= self.cluster_stagnation_limit:
+            self._add_recent_goal_region(
+                centroid_xy,
+                self.cluster_cooldown_radius_m,
+                self.cluster_stagnation_duration_sec,
+                'stagnant_cluster',
+            )
+            self.get_logger().warn(
+                'Cluster marked as stagnant and temporarily cooled down: '
+                'centroid=(%.2f,%.2f), count=%d'
+                % (centroid_xy[0], centroid_xy[1], count)
+            )
+
     def _start_candidate_path_checks(
         self,
         candidates: Sequence[FrontierCandidate],
         robot_xy: WorldPoint,
+        goal_kind: str = 'frontier',
+        filter_new_enough: bool = True,
     ):
-        self.pending_candidates_queue = [
-            candidate
-            for candidate in candidates
-            if self._candidate_is_new_enough(candidate)
-        ]
+        if filter_new_enough:
+            self.pending_candidates_queue = [
+                candidate
+                for candidate in candidates
+                if self._candidate_is_new_enough(candidate)
+            ]
+        else:
+            self.pending_candidates_queue = list(candidates)
+
+        self.pending_candidates_goal_kind = goal_kind
         self.path_check_attempts_this_cycle = 0
         self.pending_candidate_index = 0
 
         if not self.pending_candidates_queue:
-            self._publish_status('NO_NEW_FRONTIER_GOAL')
+            if goal_kind == 'high_cost_escape':
+                self._handle_high_cost_escape_failed('empty_candidate_queue')
+            else:
+                self._publish_status('NO_NEW_FRONTIER_GOAL')
             return
 
         self._try_next_path_candidate(robot_xy)
@@ -1522,11 +2564,18 @@ class ActiveSlamNode(Node):
             self.path_check_attempts_this_cycle
             >= self.max_path_check_attempts_per_cycle
         ):
-            self._publish_status(
-                'NO_PATH_CANDIDATES attempts=%d'
-                % self.path_check_attempts_this_cycle
-            )
-            self.last_goal_done_time = self.get_clock().now()
+            if self.pending_candidates_goal_kind == 'high_cost_escape':
+                self.get_logger().warn(
+                    'High-cost escape failed: no candidate path passed within %d attempts'
+                    % self.max_path_check_attempts_per_cycle
+                )
+                self._handle_high_cost_escape_failed('max_path_attempts')
+                return
+
+            if self._try_send_idle_high_cost_escape_goal(robot_xy):
+                return
+
+            self._finish_no_path_candidates(robot_xy)
             return
 
         while self.pending_candidates_queue:
@@ -1534,7 +2583,10 @@ class ActiveSlamNode(Node):
             candidate_index = self.pending_candidate_index + 1
             self.pending_candidate_index = candidate_index
 
-            if self._is_blacklisted(candidate.goal_xy):
+            if (
+                self.pending_candidates_goal_kind != 'high_cost_escape'
+                and self._is_blacklisted(candidate.goal_xy)
+            ):
                 self.last_candidate_rejections['blacklisted'] = (
                     self.last_candidate_rejections.get('blacklisted', 0) + 1
                 )
@@ -1550,17 +2602,611 @@ class ActiveSlamNode(Node):
             goal_pose = self._make_goal_pose(candidate.goal_xy, robot_xy)
             self.last_selected_pose = goal_pose
             self.selected_goal_pub.publish(goal_pose)
-            self._start_compute_path_check(goal_pose, candidate, candidate_index)
+            self._start_compute_path_check(
+                goal_pose,
+                candidate,
+                candidate_index,
+                goal_kind=self.pending_candidates_goal_kind,
+            )
             return
 
-        self._publish_status('NO_PATH_CANDIDATES queue_empty')
+        if self.pending_candidates_goal_kind == 'high_cost_escape':
+            self.get_logger().warn(
+                'High-cost escape failed: all candidate paths were rejected'
+            )
+            self._handle_high_cost_escape_failed('all_candidate_paths_rejected')
+            return
+
+        if self._try_send_idle_high_cost_escape_goal(robot_xy):
+            return
+
+        self._finish_no_path_candidates(robot_xy)
+
+    def _finish_no_path_candidates(
+        self,
+        robot_xy: Optional[WorldPoint] = None,
+    ):
+        self.no_path_candidate_cycles += 1
+
+        if self._should_start_local_unstuck_after_no_path(robot_xy):
+            self._start_local_unstuck_escape('repeated_no_path_high_cost')
+            return
+
+        self._publish_status(
+            'NO_PATH_CANDIDATES attempts=%d no_path_blacklist_count=%d'
+            % (
+                self.path_check_attempts_this_cycle,
+                len(self.no_path_blacklisted_goals),
+            )
+        )
         self.last_goal_done_time = self.get_clock().now()
+
+    def _should_start_local_unstuck_after_no_path(
+        self,
+        robot_xy: Optional[WorldPoint] = None,
+    ) -> bool:
+        if not self.enable_local_unstuck_escape:
+            return False
+
+        if self.local_unstuck_after_no_path_cycles <= 0:
+            return False
+
+        if self.no_path_candidate_cycles < self.local_unstuck_after_no_path_cycles:
+            return False
+
+        if not self._robot_currently_in_high_cost(robot_xy):
+            self.no_path_candidate_cycles = 0
+            return False
+
+        return self._local_unstuck_available()
+
+    def _handle_high_cost_escape_failed(self, reason: str) -> bool:
+        self._publish_status('HIGH_COST_ESCAPE_FAILED reason=%s' % reason)
+        self.high_cost_escape_active = False
+        self.high_cost_escape_original_goal_xy = None
+        self.last_goal_done_time = self.get_clock().now()
+
+        if (
+            self.enable_local_unstuck_escape
+            and self.local_unstuck_after_high_cost_escape_failed
+            and self._local_unstuck_available()
+        ):
+            self._start_local_unstuck_escape('high_cost_escape_failed')
+            return True
+
+        return False
+
+    def _local_unstuck_available(self) -> bool:
+        if self.goal_active or self.path_check_active:
+            return False
+
+        if self.local_unstuck_active:
+            return False
+
+        now_sec = self._now_seconds()
+        if (
+            now_sec - self.last_local_unstuck_time_sec
+            < self.local_unstuck_cooldown_sec
+        ):
+            return False
+
+        if self.consecutive_local_unstuck_count >= self.local_unstuck_max_consecutive:
+            self._publish_status('LOCAL_UNSTUCK_ESCAPE_GIVE_UP')
+            self.get_logger().warn(
+                'Local unstuck escape give up after %d consecutive attempts'
+                % self.consecutive_local_unstuck_count
+            )
+            return False
+
+        return True
+
+    def _robot_currently_in_high_cost(
+        self,
+        robot_xy: Optional[WorldPoint] = None,
+    ) -> bool:
+        if self.map_msg is None:
+            return False
+
+        if robot_xy is None:
+            robot_xy = self._lookup_robot_xy()
+            if robot_xy is None:
+                return False
+
+        grid = self._map_to_numpy(self.map_msg)
+        self.map_helpers = self._precompute_map_helpers(grid)
+        obstacle_dist, unknown_dist = self._robot_clearance_distances(
+            robot_xy,
+            grid,
+            self.map_helpers,
+        )
+        high_cost_trap = (
+            obstacle_dist < self.high_cost_escape_obstacle_dist_m
+            or unknown_dist < self.high_cost_escape_unknown_dist_m
+        )
+        if not high_cost_trap:
+            self.consecutive_local_unstuck_count = 0
+
+        return high_cost_trap
+
+    def _start_local_unstuck_escape(self, reason: str) -> bool:
+        if not self.enable_local_unstuck_escape:
+            return False
+
+        if self.goal_active or self.path_check_active:
+            return False
+
+        if not self._local_unstuck_available():
+            return False
+
+        now_sec = self._now_seconds()
+        self.local_unstuck_turn_direction = self._choose_local_unstuck_turn_direction()
+        self.local_unstuck_active = True
+        self.local_unstuck_until_sec = now_sec + self.local_unstuck_duration_sec
+        self.last_local_unstuck_time_sec = now_sec
+        self.consecutive_local_unstuck_count += 1
+        self.pending_candidates_queue = []
+        self.pending_candidates_goal_kind = 'frontier'
+        self.path_check_attempts_this_cycle = 0
+        self._publish_status('LOCAL_UNSTUCK_ESCAPE_STARTED reason=%s' % reason)
+        self.get_logger().warn(
+            'Local unstuck escape started: reason=%s duration=%.1f linear=%.3f angular=%.3f direction=%.1f attempt=%d/%d'
+            % (
+                reason,
+                self.local_unstuck_duration_sec,
+                self.local_unstuck_linear_vel,
+                self.local_unstuck_angular_vel,
+                self.local_unstuck_turn_direction,
+                self.consecutive_local_unstuck_count,
+                self.local_unstuck_max_consecutive,
+            )
+        )
+        self._publish_local_unstuck_cmd_vel()
+        return True
+
+    def _choose_local_unstuck_turn_direction(self) -> float:
+        self.local_unstuck_turn_direction *= -1.0
+
+        if self.map_msg is None or self.last_robot_xy is None:
+            return self.local_unstuck_turn_direction
+
+        grid = self._map_to_numpy(self.map_msg)
+        self.map_helpers = self._precompute_map_helpers(grid)
+        robot_xy = self.last_robot_xy
+        sample_distance_m = max(0.25, min(0.60, self.high_cost_escape_goal_distance_m))
+        left_clearance = self._sample_direction_occupied_clearance(
+            robot_xy,
+            math.pi * 0.5,
+            sample_distance_m,
+            grid,
+        )
+        right_clearance = self._sample_direction_occupied_clearance(
+            robot_xy,
+            -math.pi * 0.5,
+            sample_distance_m,
+            grid,
+        )
+
+        if left_clearance > right_clearance + 1e-3:
+            return 1.0
+        if right_clearance > left_clearance + 1e-3:
+            return -1.0
+
+        return self.local_unstuck_turn_direction
+
+    def _sample_direction_occupied_clearance(
+        self,
+        robot_xy: WorldPoint,
+        angle: float,
+        distance_m: float,
+        grid: np.ndarray,
+    ) -> float:
+        if self.map_msg is None:
+            return 0.0
+
+        sample_xy = (
+            robot_xy[0] + math.cos(angle) * distance_m,
+            robot_xy[1] + math.sin(angle) * distance_m,
+        )
+        sample_cell = self._world_to_map(sample_xy[0], sample_xy[1], self.map_msg)
+        if sample_cell is None:
+            return 0.0
+
+        distance_grid = self.map_helpers.get('occupied_distance_m')
+        if distance_grid is None:
+            return (
+                self.high_cost_escape_min_clearance_m
+                if self._has_occupied_clearance_fast(
+                    sample_cell,
+                    grid,
+                    self.high_cost_escape_min_clearance_m,
+                )
+                else 0.0
+            )
+
+        x, y = sample_cell
+        return float(distance_grid[y, x])
+
+    def _process_local_unstuck_escape(self) -> bool:
+        if not self.local_unstuck_active:
+            return False
+
+        if self.goal_active or self.path_check_active:
+            self.local_unstuck_active = False
+            self._publish_zero_cmd_vel()
+            return False
+
+        now_sec = self._now_seconds()
+        if now_sec < self.local_unstuck_until_sec:
+            self._publish_local_unstuck_cmd_vel()
+            self._publish_status('LOCAL_UNSTUCK_ESCAPE_ACTIVE')
+            return True
+
+        self._publish_zero_cmd_vel()
+        self.local_unstuck_active = False
+        self.local_unstuck_until_sec = 0.0
+        if self.local_unstuck_clear_costmap_after:
+            self._clear_local_costmap()
+        self._publish_status('LOCAL_UNSTUCK_ESCAPE_DONE')
+        self.last_goal_done_time = self.get_clock().now()
+        return True
+
+    def _publish_local_unstuck_cmd_vel(self):
+        twist = Twist()
+        twist.linear.x = self.local_unstuck_linear_vel
+        twist.angular.z = (
+            self.local_unstuck_turn_direction * self.local_unstuck_angular_vel
+        )
+        self.cmd_vel_pub.publish(twist)
+        self._warn_if_cmd_vel_has_no_subscribers()
+
+    def _try_send_idle_high_cost_escape_goal(
+        self,
+        robot_xy: Optional[WorldPoint] = None,
+    ) -> bool:
+        if not self.enable_high_cost_escape:
+            return False
+
+        if self.pending_candidates_goal_kind == 'high_cost_escape':
+            return False
+
+        if self.goal_active or self.path_check_active:
+            return False
+
+        if self.map_msg is None:
+            return False
+
+        if robot_xy is None:
+            robot_xy = self._lookup_robot_xy()
+            if robot_xy is None:
+                return False
+
+        grid = self._map_to_numpy(self.map_msg)
+        self.map_helpers = self._precompute_map_helpers(grid)
+        obstacle_dist, unknown_dist = self._robot_clearance_distances(
+            robot_xy,
+            grid,
+            self.map_helpers,
+        )
+
+        high_cost_trap = (
+            obstacle_dist < self.high_cost_escape_obstacle_dist_m
+            or unknown_dist < self.high_cost_escape_unknown_dist_m
+        )
+        if not high_cost_trap:
+            return False
+
+        self.get_logger().warn(
+            'Idle high-cost trap detected after no_path candidates: '
+            'obstacle_dist=%.2f, unknown_dist=%.2f'
+            % (obstacle_dist, unknown_dist)
+        )
+        self._publish_status('IDLE_HIGH_COST_ESCAPE_TRIGGERED')
+        self.high_cost_escape_active = True
+        self.high_cost_escape_original_goal_xy = self.last_sent_goal_xy
+
+        if self._try_send_high_cost_escape_goal(
+            robot_xy,
+            grid,
+            self.map_helpers,
+        ):
+            return True
+
+        self._publish_status('IDLE_HIGH_COST_ESCAPE_FAILED')
+        return False
+
+    def _try_send_corner_escape_goal(
+        self,
+        robot_xy: WorldPoint,
+        grid: np.ndarray,
+    ) -> bool:
+        if not self.enable_corner_escape:
+            return False
+        if self.goal_active or self.path_check_active:
+            return False
+        if self.no_valid_frontier_cycles < self.corner_escape_trigger_cycles:
+            return False
+
+        now_sec = self._now_seconds()
+        if now_sec - self.last_corner_escape_time_sec < self.corner_escape_cooldown_sec:
+            return False
+
+        self.get_logger().warn(
+            'Corner escape triggered after %d no-valid-frontier cycles'
+            % self.no_valid_frontier_cycles
+        )
+
+        escape_candidates = self._select_corner_escape_candidates(robot_xy, grid)
+        if not escape_candidates:
+            self._publish_status('CORNER_ESCAPE_FAILED')
+            self.last_corner_escape_time_sec = now_sec
+            return False
+
+        escape_candidate = escape_candidates[0]
+        clearance = self._corner_escape_clearance(escape_candidate.goal_cell, grid)
+        self.get_logger().warn(
+            'Sending corner escape goal x=%.2f y=%.2f clearance=%.2f'
+            % (
+                escape_candidate.goal_xy[0],
+                escape_candidate.goal_xy[1],
+                clearance,
+            )
+        )
+
+        self.last_corner_escape_time_sec = now_sec
+        self._publish_status('CORNER_ESCAPE_CHECKING_PATH')
+        self._start_candidate_path_checks(
+            escape_candidates,
+            robot_xy,
+            goal_kind='corner_escape',
+            filter_new_enough=False,
+        )
+        return True
+
+    def _try_send_high_cost_escape_goal(
+        self,
+        robot_xy: WorldPoint,
+        grid: np.ndarray,
+        map_helpers: Optional[Dict[str, np.ndarray]] = None,
+    ) -> bool:
+        if not self.enable_high_cost_escape:
+            return False
+
+        if self.goal_active or self.path_check_active:
+            return False
+
+        if not self.compute_path_client.server_is_ready():
+            self._warn_throttled(
+                'high_cost_compute_path',
+                'High-cost escape failed because ComputePathToPose is not ready.',
+                period_sec=5.0,
+            )
+            return self._handle_high_cost_escape_failed('compute_path_not_ready')
+
+        if map_helpers is None:
+            map_helpers = self._precompute_map_helpers(grid)
+        self.map_helpers = map_helpers
+
+        escape_candidates = self._select_high_cost_escape_candidates(
+            robot_xy,
+            grid,
+            map_helpers,
+        )
+        if not escape_candidates:
+            self.get_logger().warn(
+                'High-cost escape failed: no known-free candidate with clearance >= %.2f m'
+                % self.high_cost_escape_min_clearance_m
+            )
+            return self._handle_high_cost_escape_failed('no_clear_escape_candidate')
+
+        self._publish_status('HIGH_COST_ESCAPE_CHECKING_PATH')
+        self._start_candidate_path_checks(
+            escape_candidates,
+            robot_xy,
+            goal_kind='high_cost_escape',
+            filter_new_enough=False,
+        )
+        return True
+
+    def _select_high_cost_escape_candidates(
+        self,
+        robot_xy: WorldPoint,
+        grid: np.ndarray,
+        map_helpers: Dict[str, np.ndarray],
+    ) -> List[FrontierCandidate]:
+        if self.map_msg is None:
+            return []
+
+        candidates = []
+        directions = max(4, self.high_cost_escape_max_candidates)
+        occupied_distance = map_helpers.get('occupied_distance_m')
+        unknown_distance = map_helpers.get('unknown_distance_m')
+        reference_goal_xy = self.high_cost_escape_original_goal_xy or self.current_goal_xy
+        radii = list(self.high_cost_escape_candidate_radii_m)
+        if self.high_cost_escape_goal_distance_m not in radii:
+            radii.append(self.high_cost_escape_goal_distance_m)
+        seen_cells = set()
+
+        for radius in radii:
+            for i in range(directions):
+                angle = (2.0 * math.pi * i) / directions
+                raw_goal_xy = (
+                    robot_xy[0] + math.cos(angle) * radius,
+                    robot_xy[1] + math.sin(angle) * radius,
+                )
+                cell = self._world_to_map(
+                    raw_goal_xy[0],
+                    raw_goal_xy[1],
+                    self.map_msg,
+                )
+                if cell is None:
+                    continue
+                if cell in seen_cells:
+                    continue
+                seen_cells.add(cell)
+                if not self._is_free_cell(cell, grid):
+                    continue
+                if not self._has_occupied_clearance_fast(
+                    cell,
+                    grid,
+                    self.high_cost_escape_min_clearance_m,
+                ):
+                    continue
+
+                x, y = cell
+                occupied_clearance = (
+                    float(occupied_distance[y, x])
+                    if occupied_distance is not None
+                    else self.high_cost_escape_min_clearance_m
+                )
+                unknown_clearance = (
+                    float(unknown_distance[y, x])
+                    if unknown_distance is not None
+                    else 0.0
+                )
+                goal_xy = self._map_to_world(x, y, self.map_msg)
+                distance_from_current_goal = (
+                    self._distance(goal_xy, reference_goal_xy)
+                    if reference_goal_xy is not None
+                    else 0.0
+                )
+                distance_m = self._distance(robot_xy, goal_xy)
+                score = (
+                    2.0 * occupied_clearance
+                    + 0.8 * unknown_clearance
+                    + 0.3 * distance_from_current_goal
+                )
+                candidates.append(
+                    FrontierCandidate(
+                        utility=score,
+                        goal_cell=cell,
+                        goal_xy=goal_xy,
+                        cluster=[],
+                        path_entropy=0.0,
+                        distance_m=distance_m,
+                    )
+                )
+
+        candidates.sort(key=lambda candidate: candidate.utility, reverse=True)
+        return candidates
+
+    def _start_pending_high_cost_escape(self):
+        self.high_cost_escape_cancel_pending = False
+
+        if self.map_msg is None:
+            self._publish_status('HIGH_COST_ESCAPE_FAILED')
+            self.high_cost_escape_active = False
+            self.high_cost_escape_original_goal_xy = None
+            return
+
+        robot_xy = self._lookup_robot_xy()
+        if robot_xy is None:
+            self._publish_status('HIGH_COST_ESCAPE_FAILED')
+            self.high_cost_escape_active = False
+            self.high_cost_escape_original_goal_xy = None
+            return
+
+        grid = self._map_to_numpy(self.map_msg)
+        self.map_helpers = self._precompute_map_helpers(grid)
+        if not self._try_send_high_cost_escape_goal(
+            robot_xy,
+            grid,
+            self.map_helpers,
+        ):
+            if not self.local_unstuck_active:
+                self.high_cost_escape_active = False
+                self.high_cost_escape_original_goal_xy = None
+            self.last_goal_done_time = self.get_clock().now()
+
+    def _select_corner_escape_candidate(
+        self,
+        robot_xy: WorldPoint,
+        grid: np.ndarray,
+    ) -> Optional[FrontierCandidate]:
+        candidates = self._select_corner_escape_candidates(robot_xy, grid)
+        return candidates[0] if candidates else None
+
+    def _select_corner_escape_candidates(
+        self,
+        robot_xy: WorldPoint,
+        grid: np.ndarray,
+    ) -> List[FrontierCandidate]:
+        if self.map_msg is None:
+            return []
+
+        self.map_helpers = self._precompute_map_helpers(grid)
+        candidates = []
+        directions = max(4, self.corner_escape_max_candidates)
+
+        for i in range(directions):
+            angle = (2.0 * math.pi * i) / directions
+            goal_xy = (
+                robot_xy[0] + math.cos(angle) * self.corner_escape_distance_m,
+                robot_xy[1] + math.sin(angle) * self.corner_escape_distance_m,
+            )
+            cell = self._world_to_map(goal_xy[0], goal_xy[1], self.map_msg)
+            if cell is None:
+                continue
+            if not self._is_free_cell(cell, grid):
+                continue
+            if not self._has_occupied_clearance_fast(
+                cell,
+                grid,
+                self.corner_escape_min_clearance_m,
+            ):
+                continue
+            if not self._has_unknown_clearance_fast(cell, grid, 0.05):
+                continue
+
+            x, y = cell
+            occupied_distance = self.map_helpers.get('occupied_distance_m')
+            unknown_distance = self.map_helpers.get('unknown_distance_m')
+            clearance = (
+                float(occupied_distance[y, x])
+                if occupied_distance is not None
+                else self.corner_escape_min_clearance_m
+            )
+            unknown_clearance = (
+                float(unknown_distance[y, x])
+                if unknown_distance is not None
+                else 0.0
+            )
+            distance_m = self._distance(robot_xy, goal_xy)
+            score = clearance + 0.25 * unknown_clearance - 0.05 * distance_m
+            candidates.append(
+                FrontierCandidate(
+                    utility=score,
+                    goal_cell=cell,
+                    goal_xy=goal_xy,
+                    cluster=[],
+                    path_entropy=0.0,
+                    distance_m=distance_m,
+                )
+            )
+
+        candidates.sort(key=lambda candidate: candidate.utility, reverse=True)
+        return candidates
+
+    def _corner_escape_clearance(
+        self,
+        cell: GridCell,
+        grid: np.ndarray,
+    ) -> float:
+        if not self.map_helpers:
+            self.map_helpers = self._precompute_map_helpers(grid)
+
+        occupied_distance = self.map_helpers.get('occupied_distance_m')
+        if occupied_distance is None:
+            return self.corner_escape_min_clearance_m
+
+        x, y = cell
+        return float(occupied_distance[y, x])
 
     def _start_compute_path_check(
         self,
         goal_pose: PoseStamped,
         candidate: FrontierCandidate,
         candidate_index: int = 1,
+        goal_kind: str = 'frontier',
     ):
         goal_msg = ComputePathToPose.Goal()
         goal_msg.goal = goal_pose
@@ -1572,16 +3218,28 @@ class ActiveSlamNode(Node):
         self.pending_goal_pose = goal_pose
         self.pending_candidate = candidate
         self.pending_candidate_index = candidate_index
+        self.pending_goal_kind = goal_kind
 
-        self._publish_status(
-            'CHECKING_PATH candidate=%d goal=(%.2f,%.2f) distance=%.2f'
-            % (
-                candidate_index,
-                candidate.goal_xy[0],
-                candidate.goal_xy[1],
-                candidate.distance_m,
+        if goal_kind == 'high_cost_escape':
+            self._publish_status(
+                'HIGH_COST_ESCAPE_CHECKING_PATH candidate=%d goal=(%.2f,%.2f) distance=%.2f'
+                % (
+                    candidate_index,
+                    candidate.goal_xy[0],
+                    candidate.goal_xy[1],
+                    candidate.distance_m,
+                )
             )
-        )
+        else:
+            self._publish_status(
+                'CHECKING_PATH candidate=%d goal=(%.2f,%.2f) distance=%.2f'
+                % (
+                    candidate_index,
+                    candidate.goal_xy[0],
+                    candidate.goal_xy[1],
+                    candidate.distance_m,
+                )
+            )
 
         self.get_logger().info(
             'Checking Nav2 path candidate=%d x=%.2f y=%.2f utility=%.3f '
@@ -1668,6 +3326,77 @@ class ActiveSlamNode(Node):
             self.get_logger().warn('ComputePathToPose passed but pending goal state was empty')
             return
 
+        self.current_path_uncertainty = self._estimate_path_uncertainty(path)
+        if (
+            self.pending_goal_kind == 'frontier'
+            and self.enable_relay_goal_for_far_frontier
+            and candidate.distance_m > self.relay_goal_distance_m
+        ):
+            self.get_logger().info(
+                'Selected far frontier x=%.2f y=%.2f original_d=%.2f'
+                % (
+                    candidate.goal_xy[0],
+                    candidate.goal_xy[1],
+                    candidate.distance_m,
+                )
+            )
+            robot_xy = self._lookup_robot_xy()
+            relay_pose = None
+            if robot_xy is not None:
+                relay_pose = self._make_relay_goal_from_path(path, candidate, robot_xy)
+            if relay_pose is not None:
+                relay_xy = (
+                    relay_pose.pose.position.x,
+                    relay_pose.pose.position.y,
+                )
+                relay_distance_m = (
+                    self._distance(relay_xy, robot_xy)
+                    if robot_xy is not None
+                    else self.relay_goal_distance_m
+                )
+                relay_candidate = FrontierCandidate(
+                    utility=candidate.utility,
+                    goal_cell=self._world_to_map(
+                        relay_xy[0],
+                        relay_xy[1],
+                        self.map_msg,
+                    ) or candidate.goal_cell,
+                    goal_xy=relay_xy,
+                    cluster=candidate.cluster,
+                    path_entropy=candidate.path_entropy,
+                    distance_m=relay_distance_m,
+                )
+                self.get_logger().info(
+                    'Sending relay goal x=%.2f y=%.2f relay_d=%.2f'
+                    % (
+                        relay_xy[0],
+                        relay_xy[1],
+                        relay_distance_m,
+                    )
+                )
+                self._publish_status(
+                    'RELAY_GOAL_SENT original_d=%.2f relay_d=%.2f'
+                    % (candidate.distance_m, relay_distance_m)
+                )
+                self._send_nav_goal(
+                    relay_pose,
+                    relay_candidate,
+                    goal_kind='relay',
+                    relay_original_goal_xy=candidate.goal_xy,
+                )
+                return
+
+        if self.pending_goal_kind == 'high_cost_escape':
+            clearance = self._corner_escape_clearance(candidate.goal_cell, self._map_to_numpy(self.map_msg))
+            self.get_logger().warn(
+                'Sending high-cost escape goal x=%.2f y=%.2f clearance=%.2f'
+                % (
+                    candidate.goal_xy[0],
+                    candidate.goal_xy[1],
+                    clearance,
+                )
+            )
+
         self.get_logger().info(
             'ComputePathToPose passed for candidate=%d goal x=%.2f y=%.2f poses=%d'
             % (
@@ -1677,7 +3406,104 @@ class ActiveSlamNode(Node):
                 pose_count,
             )
         )
-        self._send_nav_goal(goal_pose, candidate)
+        self._send_nav_goal(goal_pose, candidate, goal_kind=self.pending_goal_kind)
+
+    def _estimate_path_uncertainty(self, path) -> str:
+        if self.map_msg is None:
+            return 'mixed'
+
+        grid = self._map_to_numpy(self.map_msg)
+        stride = max(1, self.path_check_stride)
+        unknown_count = 0
+        uncertain_count = 0
+        sample_count = 0
+
+        for i, pose_stamped in enumerate(path.poses):
+            if i % stride != 0 and i != len(path.poses) - 1:
+                continue
+            cell = self._world_to_map(
+                pose_stamped.pose.position.x,
+                pose_stamped.pose.position.y,
+                self.map_msg,
+            )
+            if cell is None:
+                continue
+            x, y = cell
+            value = int(grid[y, x])
+            sample_count += 1
+            if value == self.unknown_value:
+                unknown_count += 1
+            elif self.free_max_value < value < self.occupied_min_value:
+                uncertain_count += 1
+
+        if sample_count == 0:
+            return 'mixed'
+
+        unknown_ratio = unknown_count / sample_count
+        uncertain_ratio = uncertain_count / sample_count
+        if unknown_ratio > 0.25:
+            return 'unknown'
+        if unknown_ratio + uncertain_ratio > 0.20:
+            return 'mixed'
+        return 'known'
+
+    def _make_relay_goal_from_path(
+        self,
+        path,
+        candidate: FrontierCandidate,
+        robot_xy: WorldPoint,
+    ) -> Optional[PoseStamped]:
+        if self.map_msg is None or len(path.poses) < 2:
+            return None
+
+        grid = self._map_to_numpy(self.map_msg)
+        self.map_helpers = self._precompute_map_helpers(grid)
+        min_distance_m = max(0.0, self.relay_goal_distance_m - 1.0)
+        max_distance_m = self.relay_goal_max_search_ahead_m
+        best_pose = None
+        best_error = float('inf')
+
+        for i, pose_stamped in enumerate(path.poses[:-1]):
+            xy = (
+                pose_stamped.pose.position.x,
+                pose_stamped.pose.position.y,
+            )
+            distance_m = self._distance(robot_xy, xy)
+            if distance_m < min_distance_m or distance_m > max_distance_m:
+                continue
+
+            cell = self._world_to_map(xy[0], xy[1], self.map_msg)
+            if cell is None:
+                continue
+            traversable, _ = self._is_path_cell_traversable(cell, grid)
+            if not traversable:
+                continue
+            if not self._has_occupied_clearance_fast(
+                cell,
+                grid,
+                self.relay_goal_min_clearance_m,
+            ):
+                continue
+
+            error = abs(distance_m - self.relay_goal_distance_m)
+            if error < best_error:
+                next_pose = path.poses[min(i + 1, len(path.poses) - 1)]
+                relay_pose = PoseStamped()
+                relay_pose.header.frame_id = self.global_frame
+                relay_pose.header.stamp = self.get_clock().now().to_msg()
+                relay_pose.pose.position.x = xy[0]
+                relay_pose.pose.position.y = xy[1]
+                relay_pose.pose.position.z = 0.0
+                yaw = math.atan2(
+                    next_pose.pose.position.y - xy[1],
+                    next_pose.pose.position.x - xy[0],
+                )
+                relay_pose.pose.orientation.z = math.sin(yaw * 0.5)
+                relay_pose.pose.orientation.w = math.cos(yaw * 0.5)
+                best_pose = relay_pose
+                best_error = error
+
+        return best_pose
 
     def _is_path_safe(self, path) -> Tuple[bool, str]:
         if self.map_msg is None:
@@ -1687,6 +3513,17 @@ class ActiveSlamNode(Node):
         self.map_helpers = self._precompute_map_helpers(grid)
         stride = max(1, self.path_check_stride)
         pose_count = len(path.poses)
+        hard_clearance_m = max(0.0, self.path_clearance_hard_m)
+        configured_soft_clearance_m = (
+            self.path_clearance_soft_m
+            if self.path_clearance_soft_m > 0.0
+            else self.path_clearance_radius_m
+        )
+        soft_clearance_m = max(hard_clearance_m, configured_soft_clearance_m)
+        sample_count = 0
+        soft_violations = 0
+        consecutive_violations = 0
+        max_consecutive_violations = 0
 
         for i, pose_stamped in enumerate(path.poses):
             if i % stride != 0 and i != pose_count - 1:
@@ -1703,12 +3540,34 @@ class ActiveSlamNode(Node):
             if not traversable:
                 return False, reason
 
-            if not self._has_occupied_clearance_fast(
-                cell,
-                grid,
-                self.path_clearance_radius_m,
-            ):
-                return False, 'path_occupied_clearance'
+            sample_count += 1
+            occupied_distance_m = self._occupied_clearance_distance_m(cell, grid)
+            if occupied_distance_m < hard_clearance_m:
+                self.get_logger().warn(
+                    'path_clearance_check: samples=%d soft_violations=%d '
+                    'ratio=%.3f max_consecutive=%d'
+                    % (
+                        sample_count,
+                        soft_violations,
+                        (
+                            soft_violations / sample_count
+                            if sample_count > 0
+                            else 0.0
+                        ),
+                        max_consecutive_violations,
+                    )
+                )
+                return False, 'path_hard_occupied_clearance'
+
+            if occupied_distance_m < soft_clearance_m:
+                soft_violations += 1
+                consecutive_violations += 1
+                max_consecutive_violations = max(
+                    max_consecutive_violations,
+                    consecutive_violations,
+                )
+            else:
+                consecutive_violations = 0
 
             if self.path_unknown_clearance_radius_m > 0.0:
                 if not self._has_unknown_clearance_fast(
@@ -1718,7 +3577,67 @@ class ActiveSlamNode(Node):
                 ):
                     return False, 'path_unknown_clearance'
 
+        violation_ratio = (
+            soft_violations / sample_count
+            if sample_count > 0
+            else 0.0
+        )
+        self._warn_throttled(
+            'path_clearance_check',
+            'path_clearance_check: samples=%d soft_violations=%d ratio=%.3f max_consecutive=%d'
+            % (
+                sample_count,
+                soft_violations,
+                violation_ratio,
+                max_consecutive_violations,
+            ),
+            period_sec=2.0,
+        )
+
+        if violation_ratio > self.max_path_clearance_violation_ratio:
+            return False, 'path_soft_occupied_clearance_ratio'
+
+        if (
+            max_consecutive_violations
+            > self.max_consecutive_clearance_violations
+        ):
+            return False, 'path_soft_occupied_clearance_consecutive'
+
         return True, 'ok'
+
+    def _occupied_clearance_distance_m(
+        self,
+        cell: GridCell,
+        grid: np.ndarray,
+    ) -> float:
+        distance_grid = self.map_helpers.get('occupied_distance_m')
+        if distance_grid is not None:
+            x, y = cell
+            return float(distance_grid[y, x])
+
+        if not self._has_occupied_clearance(
+            cell,
+            grid,
+            self.path_clearance_hard_m,
+        ):
+            return 0.0
+
+        if not self._has_occupied_clearance(
+            cell,
+            grid,
+            (
+                self.path_clearance_soft_m
+                if self.path_clearance_soft_m > 0.0
+                else self.path_clearance_radius_m
+            ),
+        ):
+            return self.path_clearance_hard_m
+
+        return (
+            self.path_clearance_soft_m
+            if self.path_clearance_soft_m > 0.0
+            else self.path_clearance_radius_m
+        )
 
     def _is_path_cell_traversable(
         self,
@@ -1748,12 +3667,55 @@ class ActiveSlamNode(Node):
     ):
         candidate = self.pending_candidate
         candidate_index = self.pending_candidate_index
+        pending_goal_kind = self.pending_goal_kind
         self.path_check_active = False
         self.pending_candidate = None
         self.pending_goal_pose = None
+        self.pending_goal_kind = 'frontier'
+        if not self.pending_candidates_queue:
+            self.pending_candidates_goal_kind = 'frontier'
+
+        if pending_goal_kind == 'high_cost_escape':
+            if candidate is not None:
+                self.get_logger().warn(
+                    'High-cost escape candidate=%d goal x=%.2f y=%.2f rejected: %s'
+                    % (
+                        candidate_index,
+                        candidate.goal_xy[0],
+                        candidate.goal_xy[1],
+                        reason,
+                    )
+                )
+            self._publish_status('HIGH_COST_ESCAPE_REJECTED reason=%s' % reason)
+
+            if self.pending_candidates_queue:
+                self._publish_status('HIGH_COST_ESCAPE_CHECKING_PATH')
+                self._try_next_path_candidate()
+            else:
+                self.pending_candidates_goal_kind = 'frontier'
+                self.get_logger().warn(
+                    'High-cost escape failed: all candidate paths were rejected'
+                )
+                self._handle_high_cost_escape_failed(
+                    'all_candidate_paths_rejected'
+                )
+            return
+
+        effective_count_as_path_failure = count_as_path_failure
+        if reason == 'no_path':
+            effective_count_as_path_failure = self.count_no_path_as_start_blocked
+
         start_or_costmap_blocked = False
-        if count_as_path_failure:
-            start_or_costmap_blocked = self._record_path_failure()
+        if effective_count_as_path_failure:
+            if self._current_robot_start_appears_blocked():
+                start_or_costmap_blocked = self._record_path_failure()
+            else:
+                self._warn_throttled(
+                    'path_failure_not_start_blocked',
+                    'Path check failed, but robot start does not appear blocked; '
+                    'treating this as a candidate rejection instead of costmap recovery.',
+                    period_sec=5.0,
+                )
 
         if start_or_costmap_blocked:
             self.get_logger().warn(
@@ -1769,14 +3731,48 @@ class ActiveSlamNode(Node):
             self.last_candidate_rejections[rejection_key] = (
                 self.last_candidate_rejections.get(rejection_key, 0) + 1
             )
-            self._blacklist_goal_xy(candidate.goal_xy)
+            if reason == 'no_path':
+                self._blacklist_no_path_goal_xy(candidate.goal_xy)
+                blacklist_msg = (
+                    'short no_path blacklist %.1f sec radius %.2f m'
+                    % (
+                        self.no_path_blacklist_duration_sec,
+                        self.no_path_blacklist_radius_m,
+                    )
+                )
+                self.get_logger().warn(
+                    'Blacklisted candidate=%d goal=(%.2f,%.2f) after no_path using short blacklist duration=%.1f radius=%.2f'
+                    % (
+                        candidate_index,
+                        candidate.goal_xy[0],
+                        candidate.goal_xy[1],
+                        self.no_path_blacklist_duration_sec,
+                        self.no_path_blacklist_radius_m,
+                    )
+                )
+            elif reason.startswith('path_'):
+                self._blacklist_path_safety_goal_xy(candidate.goal_xy)
+                blacklist_msg = (
+                    'path safety blacklist %.1f sec radius %.2f m'
+                    % (
+                        self.path_safety_blacklist_duration_sec,
+                        self.path_safety_blacklist_radius_m,
+                    )
+                )
+            else:
+                self._blacklist_goal_xy(candidate.goal_xy)
+                blacklist_msg = (
+                    'standard blacklist %.1f sec radius %.2f m'
+                    % (self.blacklist_duration_sec, self.blacklist_radius_m)
+                )
             self.get_logger().warn(
-                'Blacklisted candidate=%d goal x=%.2f y=%.2f after path check failure: %s'
+                'Blacklisted candidate=%d goal x=%.2f y=%.2f after path check failure: %s (%s)'
                 % (
                     candidate_index,
                     candidate.goal_xy[0],
                     candidate.goal_xy[1],
                     reason,
+                    blacklist_msg,
                 )
             )
 
@@ -1801,6 +3797,39 @@ class ActiveSlamNode(Node):
 
         self.path_failure_pause_until_sec = now_sec + self.path_failure_pause_sec
         return True
+
+    def _current_robot_start_appears_blocked(self) -> bool:
+        if self.map_msg is None:
+            return False
+
+        robot_xy = self._lookup_robot_xy()
+        if robot_xy is None:
+            return False
+
+        grid = self._map_to_numpy(self.map_msg)
+        self.map_helpers = self._precompute_map_helpers(grid)
+        return self._robot_start_appears_blocked(robot_xy, grid)
+
+    def _robot_start_appears_blocked(
+        self,
+        robot_xy: WorldPoint,
+        grid: np.ndarray,
+    ) -> bool:
+        if self.map_msg is None:
+            return False
+
+        robot_cell = self._world_to_map(robot_xy[0], robot_xy[1], self.map_msg)
+        if robot_cell is None:
+            return False
+
+        if not self._is_free_cell(robot_cell, grid):
+            return True
+
+        return not self._has_occupied_clearance_fast(
+            robot_cell,
+            grid,
+            self.start_blocked_check_clearance_m,
+        )
 
     def _path_failure_pause_active(self) -> bool:
         return self._now_seconds() < self.path_failure_pause_until_sec
@@ -1842,6 +3871,12 @@ class ActiveSlamNode(Node):
             if now_sec < self.costmap_recovery_until_sec:
                 return True
 
+            if not self.enable_recovery_spin:
+                self._finish_costmap_recovery(
+                    'Costmap recovery done after clear; recovery spin disabled'
+                )
+                return True
+
             if self.recovery_backup_duration_sec <= 0.0:
                 self.costmap_recovery_state = 'SPIN'
                 self.costmap_recovery_until_sec = (
@@ -1863,32 +3898,51 @@ class ActiveSlamNode(Node):
             if now_sec < self.costmap_recovery_until_sec:
                 return True
 
+            if not self.enable_recovery_spin:
+                self._finish_costmap_recovery(
+                    'Costmap recovery backup done; recovery spin disabled'
+                )
+                return True
+
             self.costmap_recovery_state = 'SPIN'
             self.costmap_recovery_until_sec = now_sec + self.recovery_spin_duration_sec
             self.get_logger().warn('Costmap recovery spin started')
             return True
 
         if self.costmap_recovery_state == 'SPIN':
+            if not self.enable_recovery_spin:
+                self._finish_costmap_recovery(
+                    'Costmap recovery spin skipped because recovery spin is disabled'
+                )
+                return True
+
             self._publish_spin_cmd_vel()
             self._publish_status('COSTMAP_RECOVERY_SPIN')
             if now_sec < self.costmap_recovery_until_sec:
                 return True
 
-            self._publish_zero_cmd_vel()
-            self.path_failure_times = []
-            self.path_failure_pause_until_sec = 0.0
-            self.pending_candidates_queue = []
-            self.path_check_attempts_this_cycle = 0
-            self.costmap_recovery_state = 'IDLE'
-            self.costmap_recovery_until_sec = 0.0
-            self._publish_status('COSTMAP_RECOVERY_DONE')
-            self.get_logger().warn('Costmap recovery done')
-            self.last_goal_done_time = self.get_clock().now()
+            self._finish_costmap_recovery('Costmap recovery done')
             return True
 
         self.costmap_recovery_state = 'IDLE'
         self._publish_zero_cmd_vel()
         return False
+
+    def _finish_costmap_recovery(self, log_message: str):
+        self._publish_zero_cmd_vel()
+        self.path_failure_times = []
+        self.path_failure_pause_until_sec = 0.0
+        self.pending_candidates_queue = []
+        self.path_check_attempts_this_cycle = 0
+        if self.clear_blacklist_after_costmap_recovery:
+            self.no_path_blacklisted_goals = []
+            if self.blacklist_saturation_clear_path_safety:
+                self.path_safety_blacklisted_goals = []
+        self.costmap_recovery_state = 'IDLE'
+        self.costmap_recovery_until_sec = 0.0
+        self._publish_status('COSTMAP_RECOVERY_DONE')
+        self.get_logger().warn(log_message)
+        self.last_goal_done_time = self.get_clock().now()
 
     def _clear_costmaps(self):
         self._call_clear_costmap(
@@ -1898,6 +3952,12 @@ class ActiveSlamNode(Node):
         self._call_clear_costmap(
             self.clear_global_costmap_client,
             self.clear_global_costmap_service,
+        )
+
+    def _clear_local_costmap(self):
+        self._call_clear_costmap(
+            self.clear_local_costmap_client,
+            self.clear_local_costmap_service,
         )
 
     def _call_clear_costmap(self, client, service_name: str):
@@ -2007,43 +4067,90 @@ class ActiveSlamNode(Node):
         twist = Twist()
         twist.angular.z = self.recovery_spin_angular_vel
         self.cmd_vel_pub.publish(twist)
+        self._warn_if_cmd_vel_has_no_subscribers()
 
     def _publish_backup_cmd_vel(self):
         twist = Twist()
         twist.linear.x = self.recovery_backup_linear_vel
         self.cmd_vel_pub.publish(twist)
+        self._warn_if_cmd_vel_has_no_subscribers()
 
     def _publish_zero_cmd_vel(self):
         self.cmd_vel_pub.publish(Twist())
+        self._warn_if_cmd_vel_has_no_subscribers()
+
+    def _warn_if_cmd_vel_has_no_subscribers(self):
+        if self.cmd_vel_pub.get_subscription_count() > 0:
+            return
+
+        self._warn_throttled(
+            'cmd_vel_no_subscribers',
+            'Publishing cmd_vel on %s, but no subscribers are connected. '
+            'If velocity_smoother and collision_monitor are disabled, set '
+            'active_slam cmd_vel_topic to /cmd_vel or enable the cmd_vel chain.'
+            % self.cmd_vel_topic,
+            period_sec=10.0,
+        )
 
     def _send_nav_goal(
         self,
         goal_pose: PoseStamped,
         candidate: FrontierCandidate,
+        goal_kind: str = 'frontier',
+        relay_original_goal_xy: Optional[WorldPoint] = None,
     ):
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = goal_pose
 
         self.goal_active = True
         self.goal_cancel_in_progress = False
+        self.nav_goal_sequence += 1
+        goal_sequence = self.nav_goal_sequence
+        self.active_nav_goal_sequence = goal_sequence
         self.current_goal_xy = candidate.goal_xy
+        self.current_goal_kind = goal_kind
+        self.current_goal_is_relay = goal_kind == 'relay'
+        self.current_relay_original_goal_xy = relay_original_goal_xy
+        self.corner_escape_active = goal_kind == 'corner_escape'
+        self.high_cost_escape_active = goal_kind == 'high_cost_escape'
+        self.current_goal_cluster_centroid = self._cluster_centroid_xy(
+            candidate.cluster
+        )
         self.current_goal_handle = None
         self.goal_start_time_sec = None
         self.last_sent_goal_xy = candidate.goal_xy
+        self.goal_history.append(candidate.goal_xy)
+        if len(self.goal_history) > self.ping_pong_history_length:
+            self.goal_history = self.goal_history[-self.ping_pong_history_length:]
+        self._record_cluster_selection(candidate.cluster)
         self.consecutive_too_close_spins = 0
         self.last_progress_xy = None
         self.last_progress_time_sec = self._now_seconds()
+        robot_xy = self._lookup_robot_xy() or self.last_robot_xy
+        self.nav_progress_ref_xy = robot_xy
+        self.nav_progress_ref_time_sec = self._now_seconds()
         self.pending_candidates_queue = []
         self.path_check_attempts_this_cycle = 0
+        self.no_valid_frontier_cycles = 0
+        self.no_path_candidate_cycles = 0
 
-        self._publish_status(
-            'GOAL_SENT utility=%.3f entropy=%.3f distance=%.2f'
-            % (
-                candidate.utility,
-                candidate.path_entropy,
-                candidate.distance_m,
+        if goal_kind == 'high_cost_escape':
+            self._publish_status('HIGH_COST_ESCAPE_GOAL_SENT')
+        elif goal_kind == 'corner_escape':
+            self._publish_status('CORNER_ESCAPE_GOAL_SENT')
+        elif goal_kind == 'relay':
+            self._publish_status(
+                'RELAY_GOAL_SENT relay_d=%.2f' % candidate.distance_m
             )
-        )
+        else:
+            self._publish_status(
+                'GOAL_SENT utility=%.3f entropy=%.3f distance=%.2f'
+                % (
+                    candidate.utility,
+                    candidate.path_entropy,
+                    candidate.distance_m,
+                )
+            )
 
         self.get_logger().info(
             'Sending Active SLAM goal x=%.2f y=%.2f utility=%.3f entropy=%.3f distance=%.2f cluster_size=%d'
@@ -2058,9 +4165,17 @@ class ActiveSlamNode(Node):
         )
 
         send_goal_future = self.nav_client.send_goal_async(goal_msg)
-        send_goal_future.add_done_callback(self._goal_response_callback)
+        send_goal_future.add_done_callback(
+            lambda future, sequence=goal_sequence: self._goal_response_callback(
+                future,
+                sequence,
+            )
+        )
 
-    def _goal_response_callback(self, future):
+    def _goal_response_callback(self, future, goal_sequence: int):
+        if goal_sequence != self.active_nav_goal_sequence:
+            return
+
         try:
             goal_handle = future.result()
         except Exception as exc:
@@ -2079,13 +4194,28 @@ class ActiveSlamNode(Node):
 
         self.current_goal_handle = goal_handle
         self.goal_start_time_sec = self._now_seconds()
+        robot_xy = self._lookup_robot_xy() or self.last_robot_xy
+        if robot_xy is not None:
+            self.nav_progress_ref_xy = robot_xy
+            self.nav_progress_ref_time_sec = self._now_seconds()
 
         self._publish_status('GOAL_ACCEPTED')
 
         result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._goal_result_callback)
+        result_future.add_done_callback(
+            lambda future, sequence=goal_sequence: self._goal_result_callback(
+                future,
+                sequence,
+            )
+        )
 
-    def _goal_result_callback(self, future):
+    def _goal_result_callback(self, future, goal_sequence: int):
+        if goal_sequence != self.active_nav_goal_sequence:
+            return
+
+        if self.high_cost_escape_cancel_pending and self.goal_cancel_in_progress:
+            return
+
         try:
             result = future.result()
             status = result.status
@@ -2095,10 +4225,59 @@ class ActiveSlamNode(Node):
             )
             status = None
 
+        try_high_cost_escape = False
+        try_local_unstuck_after_reset = False
+
         if status == GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info('Active SLAM goal succeeded')
-            if self.current_goal_xy is not None:
+            if self.high_cost_escape_active or self.current_goal_kind == 'high_cost_escape':
+                self.get_logger().info('High-cost escape goal succeeded')
+                self._publish_status('HIGH_COST_ESCAPE_SUCCEEDED')
+            elif self.current_goal_is_relay:
+                self.get_logger().info('Relay goal succeeded')
+                if (
+                    self.current_goal_xy is not None
+                    and self.enable_soft_recent_region_penalty
+                ):
+                    self._add_recent_goal_region(
+                        self.current_goal_xy,
+                        self.recent_goal_region_radius_m,
+                        self.recent_goal_region_duration_sec,
+                        'relay_succeeded',
+                    )
+                self._publish_status('RELAY_GOAL_SUCCEEDED')
+            elif self.corner_escape_active:
+                self.get_logger().info('Corner escape goal succeeded')
+                if (
+                    self.current_goal_xy is not None
+                    and self.enable_soft_recent_region_penalty
+                ):
+                    self._add_recent_goal_region(
+                        self.current_goal_xy,
+                        self.recent_goal_region_radius_m,
+                        self.recent_goal_region_duration_sec,
+                        'corner_escape_succeeded',
+                    )
+                self._publish_status('CORNER_ESCAPE_GOAL_SUCCEEDED')
+            elif self.current_goal_xy is not None:
                 self._mark_goal_visited(self.current_goal_xy)
+                if self.enable_soft_recent_region_penalty:
+                    self._add_recent_goal_region(
+                        self.current_goal_xy,
+                        self.recent_goal_region_radius_m,
+                        self.recent_goal_region_duration_sec,
+                        'frontier_succeeded',
+                    )
+                if (
+                    self.current_goal_cluster_centroid is not None
+                    and self.enable_cluster_cooldown_filter
+                ):
+                    self._add_recent_goal_region(
+                        self.current_goal_cluster_centroid,
+                        self.cluster_cooldown_radius_m,
+                        self.cluster_cooldown_duration_sec,
+                        'cluster_cooldown',
+                    )
                 self.get_logger().info(
                     'Marked goal as visited x=%.2f y=%.2f radius=%.2f visited_count=%d'
                     % (
@@ -2108,16 +4287,34 @@ class ActiveSlamNode(Node):
                         len(self.visited_goals),
                     )
                 )
-            self._publish_status('GOAL_SUCCEEDED')
+                self._publish_status('GOAL_SUCCEEDED')
         else:
             self.get_logger().warn(
                 'Active SLAM goal failed with status %s' % status
             )
-            self._blacklist_current_goal()
-            self._publish_status('GOAL_FAILED_BLACKLISTED')
+            if self.high_cost_escape_active or self.current_goal_kind == 'high_cost_escape':
+                self._publish_status('HIGH_COST_ESCAPE_FAILED reason=nav_goal_failed')
+                try_local_unstuck_after_reset = True
+            elif self._should_try_high_cost_escape_after_nav_failure():
+                self._publish_status('HIGH_COST_ESCAPE_TRIGGERED')
+                self.last_high_cost_escape_time_sec = self._now_seconds()
+                self.high_cost_escape_active = True
+                self.high_cost_escape_cancel_pending = True
+                self.high_cost_escape_original_goal_xy = self.current_goal_xy
+                try_high_cost_escape = True
+            else:
+                self._blacklist_current_goal()
+                self._publish_status('GOAL_FAILED_BLACKLISTED')
 
         self._reset_goal_state()
+        self.current_path_uncertainty = 'known'
         self.last_goal_done_time = self.get_clock().now()
+
+        if try_high_cost_escape:
+            self.high_cost_escape_active = True
+            self._start_pending_high_cost_escape()
+        elif try_local_unstuck_after_reset:
+            self._handle_high_cost_escape_failed('nav_goal_failed')
 
     def _nav_timeout_elapsed(self) -> bool:
         if not self.goal_active:
@@ -2158,18 +4355,28 @@ class ActiveSlamNode(Node):
             )
         )
 
-    def _cancel_current_goal(self):
+    def _cancel_current_goal(
+        self,
+        blacklist_on_cancel: bool = True,
+        cancel_status: str = 'GOAL_TIMEOUT_BLACKLISTED',
+    ):
         if self.goal_cancel_in_progress:
             return
 
         self.goal_cancel_in_progress = True
+        self.cancel_current_goal_should_blacklist = blacklist_on_cancel
+        self.cancel_current_goal_status = cancel_status
 
         if self.current_goal_handle is None:
-            self._blacklist_current_goal()
-            self._publish_status('GOAL_TIMEOUT_BLACKLISTED')
+            if self.cancel_current_goal_should_blacklist:
+                self._blacklist_current_goal()
+            self._publish_status(self.cancel_current_goal_status)
+            self.active_nav_goal_sequence = 0
             self._reset_goal_state()
             self.last_goal_done_time = self.get_clock().now()
-            if self.run_recovery_after_cancel:
+            if self.high_cost_escape_cancel_pending:
+                self._start_pending_high_cost_escape()
+            elif self.run_recovery_after_cancel:
                 self.run_recovery_after_cancel = False
                 self._start_costmap_recovery('stuck_watchdog')
             return
@@ -2183,13 +4390,17 @@ class ActiveSlamNode(Node):
         except Exception as exc:
             self.get_logger().warn('Failed to cancel Nav2 goal: %s' % exc)
 
-        self._blacklist_current_goal()
-        self._publish_status('GOAL_TIMEOUT_BLACKLISTED')
+        if self.cancel_current_goal_should_blacklist:
+            self._blacklist_current_goal()
+        self._publish_status(self.cancel_current_goal_status)
 
+        self.active_nav_goal_sequence = 0
         self._reset_goal_state()
         self.last_goal_done_time = self.get_clock().now()
 
-        if self.run_recovery_after_cancel:
+        if self.high_cost_escape_cancel_pending:
+            self._start_pending_high_cost_escape()
+        elif self.run_recovery_after_cancel:
             self.run_recovery_after_cancel = False
             self._start_costmap_recovery('stuck_watchdog')
 
@@ -2212,20 +4423,61 @@ class ActiveSlamNode(Node):
         expires_at = self._now_seconds() + self.blacklist_duration_sec
         self.blacklisted_goals.append((goal_xy, expires_at))
 
+    def _blacklist_no_path_goal_xy(self, goal_xy: WorldPoint):
+        expires_at = self._now_seconds() + self.no_path_blacklist_duration_sec
+        self.no_path_blacklisted_goals.append((goal_xy, expires_at))
+
+    def _blacklist_path_safety_goal_xy(self, goal_xy: WorldPoint):
+        expires_at = (
+            self._now_seconds() + self.path_safety_blacklist_duration_sec
+        )
+        self.path_safety_blacklisted_goals.append((goal_xy, expires_at))
+
     def _is_blacklisted(self, goal_xy: WorldPoint) -> bool:
-        return any(
+        if any(
             self._distance(goal_xy, blacklisted_xy) < self.blacklist_radius_m
             for blacklisted_xy, _ in self.blacklisted_goals
-        )
+        ):
+            return True
+
+        if any(
+            self._distance(goal_xy, blacklisted_xy)
+            < self.no_path_blacklist_radius_m
+            for blacklisted_xy, _ in self.no_path_blacklisted_goals
+        ):
+            return True
+
+        if any(
+            self._distance(goal_xy, blacklisted_xy)
+            < self.path_safety_blacklist_radius_m
+            for blacklisted_xy, _ in self.path_safety_blacklisted_goals
+        ):
+            return True
+
+        return False
 
     def _reset_goal_state(self):
         self.goal_active = False
         self.goal_cancel_in_progress = False
+        self.active_nav_goal_sequence = 0
         self.current_goal_xy = None
+        self.current_goal_kind = 'frontier'
+        self.current_goal_is_relay = False
+        self.current_relay_original_goal_xy = None
+        self.current_goal_cluster_centroid = None
+        self.corner_escape_active = False
+        if not self.high_cost_escape_cancel_pending:
+            self.high_cost_escape_active = False
+            self.high_cost_escape_original_goal_xy = None
         self.current_goal_handle = None
         self.goal_start_time_sec = None
+        self.current_path_uncertainty = 'known'
         self.last_progress_xy = None
         self.last_progress_time_sec = None
+        self.nav_progress_ref_xy = None
+        self.nav_progress_ref_time_sec = 0.0
+        self.cancel_current_goal_should_blacklist = True
+        self.cancel_current_goal_status = 'GOAL_TIMEOUT_BLACKLISTED'
 
     def _cooldown_elapsed(self) -> bool:
         elapsed = self.get_clock().now() - self.last_goal_done_time
@@ -2447,6 +4699,82 @@ class ActiveSlamNode(Node):
         total_rejections = sum(self.last_candidate_rejections.values())
         other_rejections = total_rejections - too_close
         return too_close >= other_rejections
+
+    def _unsafe_unknown_rejections_dominate(self) -> bool:
+        if not self.last_candidate_rejections:
+            return False
+
+        unsafe_unknown = self.last_candidate_rejections.get('unsafe_unknown', 0)
+        if unsafe_unknown <= 0:
+            return False
+
+        total_rejections = sum(self.last_candidate_rejections.values())
+        other_rejections = total_rejections - unsafe_unknown
+        return unsafe_unknown >= other_rejections
+
+    def _blacklist_rejections_dominate(self) -> bool:
+        if not self.last_candidate_rejections:
+            return False
+
+        blacklisted = self.last_candidate_rejections.get('blacklisted', 0)
+        if blacklisted < self.blacklist_saturation_min_count:
+            return False
+
+        total = max(sum(self.last_candidate_rejections.values()), 1)
+        return blacklisted / total >= self.blacklist_saturation_ratio
+
+    def _maybe_recover_from_blacklist_saturation(self) -> bool:
+        if not self.enable_blacklist_saturation_recovery:
+            return False
+
+        if not self._blacklist_rejections_dominate():
+            return False
+
+        now_sec = self._now_seconds()
+        if (
+            now_sec - self.last_blacklist_saturation_recovery_time_sec
+            < self.blacklist_saturation_cooldown_sec
+        ):
+            return False
+
+        blacklisted = self.last_candidate_rejections.get('blacklisted', 0)
+        total = max(sum(self.last_candidate_rejections.values()), 1)
+
+        if self.blacklist_saturation_clear_no_path:
+            if self.no_path_blacklisted_goals:
+                self.no_path_blacklisted_goals = []
+            else:
+                self.get_logger().warn(
+                    'Blacklist saturation detected but no_path blacklist already empty.'
+                )
+
+        if self.blacklist_saturation_clear_path_safety:
+            self.path_safety_blacklisted_goals = []
+
+        self.last_blacklist_saturation_recovery_time_sec = now_sec
+        self._publish_status('BLACKLIST_SATURATION_RECOVERY')
+        self.get_logger().warn(
+            'Cleared no_path blacklist because blacklist dominates: blacklisted=%d total=%d'
+            % (blacklisted, total)
+        )
+        return True
+
+    def _maybe_relax_recent_region_filter(self):
+        if not self.enable_recent_region_relaxation:
+            return
+
+        blacklisted = self.last_candidate_rejections.get('blacklisted', 0)
+        if blacklisted < self.recent_region_relaxation_blacklist_threshold:
+            return
+
+        self.recent_region_relax_until_sec = (
+            self._now_seconds() + self.recent_region_relaxation_duration_sec
+        )
+        self._warn_throttled(
+            'recent_region_relaxation',
+            'Temporarily relaxing recent region filter because blacklist dominates.',
+            period_sec=3.0,
+        )
 
     def _world_to_map(
         self,

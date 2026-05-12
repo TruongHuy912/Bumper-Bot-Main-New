@@ -7,83 +7,189 @@ active_slam_node:
     robot_base_frame: base_footprint
     nav2_action_name: /navigate_to_pose
     compute_path_action_name: /compute_path_to_pose
-    enable_compute_path_check: true
-    min_path_poses: 2
+    cmd_vel_topic: /cmd_vel_raw
+
+    control_period_sec: 0.5
+    goal_cooldown_sec: 0.3
+    nav_timeout_sec: 0.0
+
     tf_lookup_timeout_sec: 0.05
     use_last_pose_on_tf_failure: true
     max_cached_pose_age_sec: 2.0
+
+    enable_compute_path_check: true
+    min_path_poses: 2
+    max_path_check_attempts_per_cycle: 10
+
+    enable_timing_debug: false
+    timing_log_period_sec: 5.0
+
+    min_frontier_cells: 10
+    max_clusters_to_score: 16
+    max_seed_cells_per_cluster: 8
+    max_total_candidates: 90
+
+    adaptive_goal_distance_enabled: true
+    max_goal_distance_m: 9.0
+    max_goal_distance_hard_m: 15.0
+    goal_distance_expand_step_m: 2.0
+    max_goal_distance_expansions: 4
+
+    cluster_distance_weight: 0.55
+    cluster_size_weight: 0.45
+    cluster_distance_sample_count: 20
+
+    unknown_value: -1
+    free_max_value: 25
+    occupied_min_value: 65
+
+    min_goal_distance_m: 0.40
+    nav_xy_goal_tolerance_m: 0.20
+    min_goal_distance_margin_m: 0.20
+    goal_backoff_m: 0.0
+    same_goal_tolerance_m: 0.45
+
+    goal_clearance_radius_m: 0.30
+    unknown_clearance_radius_m: 0.03
+
+    allow_unknown_path_cells: true
+    allow_uncertain_path_cells: true
+    path_clearance_radius_m: 0.25
+    path_clearance_hard_m: 0.12
+    path_clearance_soft_m: 0.25
+    max_path_clearance_violation_ratio: 0.10
+    max_consecutive_clearance_violations: 5
+    path_unknown_clearance_radius_m: 0.0
+    path_check_stride: 5
+
+    visited_goal_radius_m: 0.40
+    visited_goal_duration_sec: 75.0
+    max_visited_goals: 50
+
+    blacklist_duration_sec: 8.0
+    blacklist_radius_m: 0.20
+    no_path_blacklist_duration_sec: 3.0
+    no_path_blacklist_radius_m: 0.15
+    path_safety_blacklist_duration_sec: 5.0
+    path_safety_blacklist_radius_m: 0.20
+    start_blocked_check_clearance_m: 0.12
+    count_no_path_as_start_blocked: false
+    clear_blacklist_after_costmap_recovery: true
+
+    lambda_distance: 0.10
+    entropy_weight: 1.0
+    frontier_size_weight: 0.04
+    frontier_size_norm_cells: 100.0
+    entropy_neighborhood_radius_cells: 1
+
+    enable_stuck_watchdog: true
+    stuck_check_radius_m: 0.10
+    stuck_timeout_sec: 35.0
+
     enable_recovery_spin: false
     enable_too_close_recovery_spin: false
+    too_close_recovery_threshold: 999
     too_close_recovery_cooldown_sec: 15.0
     max_consecutive_too_close_spins: 1
     recovery_spin_duration_sec: 1.5
     recovery_spin_angular_vel: 0.15
-    cmd_vel_topic: /cmd_vel
-    too_close_recovery_threshold: 999
-    path_failure_threshold: 3
-    path_failure_window_sec: 30.0
-    path_failure_pause_sec: 0.0
-    max_path_check_attempts_per_cycle: 3
-    enable_timing_debug: true
-    timing_log_period_sec: 5.0
-    max_clusters_to_score: 8
-    max_seed_cells_per_cluster: 6
-    max_total_candidates: 40
-    adaptive_goal_distance_enabled: true
-    max_goal_distance_hard_m: 8.0
-    goal_distance_expand_step_m: 1.0
-    cluster_distance_weight: 0.7
-    cluster_size_weight: 0.3
-    cluster_distance_sample_count: 20
-    visited_goal_radius_m: 0.80
-    visited_goal_duration_sec: 180.0
-    max_visited_goals: 50
-    nav_xy_goal_tolerance_m: 0.20
-    min_goal_distance_margin_m: 0.25
-    enable_stuck_watchdog: true
-    stuck_check_radius_m: 0.15
-    stuck_timeout_sec: 60.0
+
     enable_costmap_recovery: true
     clear_global_costmap_service: /global_costmap/clear_entirely_global_costmap
     clear_local_costmap_service: /local_costmap/clear_entirely_local_costmap
     recovery_backup_duration_sec: 0.0
     recovery_backup_linear_vel: -0.03
     recovery_wait_after_clear_sec: 1.0
+    path_failure_threshold: 3
+    path_failure_window_sec: 30.0
+    path_failure_pause_sec: 0.0
 
-    control_period_sec: 1.0
-    goal_cooldown_sec: 1.0
-    blacklist_duration_sec: 45.0
-    blacklist_radius_m: 0.60
-    # nav_timeout_sec=0 disables hard timeout. The stuck watchdog handles real stalls.
-    nav_timeout_sec: 0.0
+    enable_adaptive_speed: true
+    speed_limit_topic: /speed_limit
+    speed_limit_percentage: false
+    known_area_speed_mps: 0.14
+    mixed_area_speed_mps: 0.11
+    unknown_area_speed_mps: 0.09
+    near_obstacle_speed_mps: 0.075
+    unknown_slowdown_distance_m: 0.50
+    obstacle_slowdown_distance_m: 0.28
+    frontier_slowdown_distance_m: 0.60
+    speed_limit_publish_period_sec: 0.5
+    restore_full_speed_when_idle: true
+    max_speed_change_mps_per_sec: 0.15
 
-    unknown_value: -1
-    free_max_value: 25
-    occupied_min_value: 65
+    enable_relay_goal_for_far_frontier: true
+    relay_goal_distance_m: 4.5
+    relay_goal_min_clearance_m: 0.25
+    relay_goal_max_search_ahead_m: 6.0
 
-    min_frontier_cells: 20
-    min_goal_distance_m: 0.60
-    # Keep goals close so mapping expands sequentially instead of jumping far ahead.
-    max_goal_distance_m: 7.0
-    goal_clearance_radius_m: 0.35
-    unknown_clearance_radius_m: 0.10
-    path_clearance_radius_m: 0.30
-    path_unknown_clearance_radius_m: 0.0
-    path_check_stride: 3
-    allow_unknown_path_cells: true
-    allow_uncertain_path_cells: true
-    goal_backoff_m: 0.20
-    same_goal_tolerance_m: 0.80
+    enable_corner_escape: true
+    corner_escape_trigger_cycles: 5
+    corner_escape_distance_m: 1.0
+    corner_escape_min_clearance_m: 0.25
+    corner_escape_max_candidates: 16
+    corner_escape_cooldown_sec: 12.0
 
-    # Stronger distance penalty favors nearby frontiers while preserving entropy scoring.
-    lambda_distance: 0.15
-    entropy_weight: 1.0
-    frontier_size_weight: 0.02
-    frontier_size_norm_cells: 100.0
-    entropy_neighborhood_radius_cells: 1
+    enable_high_cost_escape: true
+    high_cost_escape_obstacle_dist_m: 0.30
+    high_cost_escape_unknown_dist_m: 0.30
+    high_cost_escape_stuck_time_sec: 8.0
+    high_cost_escape_min_progress_m: 0.08
+    high_cost_escape_goal_distance_m: 1.0
+    high_cost_escape_candidate_radii_m: [0.4, 0.6, 0.8, 1.0, 1.2]
+    high_cost_escape_min_clearance_m: 0.28
+    high_cost_escape_max_candidates: 24
+    high_cost_escape_cooldown_sec: 15.0
+
+    enable_local_unstuck_escape: true
+    local_unstuck_after_high_cost_escape_failed: true
+    local_unstuck_after_no_path_cycles: 2
+    local_unstuck_duration_sec: 1.8
+    local_unstuck_linear_vel: -0.045
+    local_unstuck_angular_vel: 0.25
+    local_unstuck_clear_costmap_after: true
+    local_unstuck_cooldown_sec: 8.0
+    local_unstuck_max_consecutive: 2
+
+    exploration_complete_no_frontier_cycles: 10
+    exploration_complete_min_frontier_cells: 0
+
+    enable_blacklist_saturation_recovery: true
+    blacklist_saturation_ratio: 0.55
+    blacklist_saturation_min_count: 30
+    blacklist_saturation_clear_no_path: true
+    blacklist_saturation_clear_path_safety: false
+    blacklist_saturation_cooldown_sec: 8.0
+    enable_recent_region_relaxation: true
+    recent_region_relaxation_blacklist_threshold: 40
+    recent_region_relaxation_duration_sec: 10.0
+
+    enable_anti_ping_pong: true
+    enable_hard_recent_region_filter: false
+    enable_hard_ping_pong_filter: false
+    enable_cluster_cooldown_filter: false
+    enable_soft_recent_region_penalty: true
+    recent_goal_region_radius_m: 0.35
+    recent_goal_region_duration_sec: 20.0
+    max_recent_goal_regions: 20
+    cluster_cooldown_radius_m: 0.45
+    cluster_cooldown_duration_sec: 30.0
+    ping_pong_detection_enabled: true
+    ping_pong_history_length: 6
+    ping_pong_radius_m: 0.45
+    recent_region_penalty_weight: 0.15
+    enable_cluster_stagnation_filter: false
+    cluster_stagnation_radius_m: 1.0
+    cluster_stagnation_limit: 3
+    cluster_stagnation_duration_sec: 120.0
+
+    enable_initial_scan_spin: true
+    initial_scan_spin_angular_vel: 0.35
+    initial_scan_spin_duration_sec: 18.0
+    initial_scan_min_free_cells: 50
 
     publish_markers: true
-    max_marker_frontier_points: 1500
+    max_marker_frontier_points: 800
     marker_topic: /active_slam/frontiers
     selected_goal_topic: /active_slam/selected_goal
     status_topic: /active_slam/status
