@@ -220,9 +220,12 @@ class ActiveSlamNode(Node):
         self.declare_parameter('min_frontier_cells', 20)
         self.declare_parameter('min_goal_distance_m', 0.80)
         self.declare_parameter('max_goal_distance_m', 5.0)
-        self.declare_parameter('goal_clearance_radius_m', 0.25)
-        self.declare_parameter('unknown_clearance_radius_m', 0.05)
-        self.declare_parameter('goal_backoff_m', 0.25)
+        self.declare_parameter('goal_clearance_radius_m', 0.35)
+        self.declare_parameter('unknown_clearance_radius_m', 0.10)
+        self.declare_parameter('path_clearance_radius_m', 0.35)
+        self.declare_parameter('path_unknown_clearance_radius_m', 0.05)
+        self.declare_parameter('path_check_stride', 2)
+        self.declare_parameter('goal_backoff_m', 0.35)
         self.declare_parameter('same_goal_tolerance_m', 1.00)
 
         self.declare_parameter('lambda_distance', 0.18)
@@ -360,6 +363,15 @@ class ActiveSlamNode(Node):
         )
         self.unknown_clearance_radius_m = float(
             self.get_parameter('unknown_clearance_radius_m').value
+        )
+        self.path_clearance_radius_m = float(
+            self.get_parameter('path_clearance_radius_m').value
+        )
+        self.path_unknown_clearance_radius_m = float(
+            self.get_parameter('path_unknown_clearance_radius_m').value
+        )
+        self.path_check_stride = int(
+            self.get_parameter('path_check_stride').value
         )
         self.goal_backoff_m = float(
             self.get_parameter('goal_backoff_m').value
@@ -1218,6 +1230,22 @@ class ActiveSlamNode(Node):
             self._reject_pending_path_candidate('no_path')
             return
 
+        path_safe, path_rejection_reason = self._is_path_safe(path)
+        if not path_safe:
+            self.get_logger().warn(
+                'ComputePathToPose path rejected for candidate=%d: reason=%s poses=%d'
+                % (
+                    self.pending_candidate_index,
+                    path_rejection_reason,
+                    pose_count,
+                )
+            )
+            self._reject_pending_path_candidate(
+                path_rejection_reason,
+                record_path_failure=False,
+            )
+            return
+
         candidate = self.pending_candidate
         goal_pose = self.pending_goal_pose
         self.path_check_active = False
@@ -1241,13 +1269,57 @@ class ActiveSlamNode(Node):
         )
         self._send_nav_goal(goal_pose, candidate)
 
-    def _reject_pending_path_candidate(self, reason: str):
+    def _is_path_safe(self, path) -> Tuple[bool, str]:
+        if self.map_msg is None:
+            return False, 'no_map'
+
+        grid = self._map_to_numpy(self.map_msg)
+        stride = max(1, self.path_check_stride)
+        pose_count = len(path.poses)
+
+        for i, pose_stamped in enumerate(path.poses):
+            if i % stride != 0 and i != pose_count - 1:
+                continue
+
+            x = pose_stamped.pose.position.x
+            y = pose_stamped.pose.position.y
+            cell = self._world_to_map(x, y, self.map_msg)
+
+            if cell is None:
+                return False, 'path_out_of_map'
+
+            if not self._is_free_cell(cell, grid):
+                return False, 'path_not_free'
+
+            if not self._has_occupied_clearance(
+                cell,
+                grid,
+                self.path_clearance_radius_m,
+            ):
+                return False, 'path_occupied_clearance'
+
+            if not self._has_unknown_clearance(
+                cell,
+                grid,
+                self.path_unknown_clearance_radius_m,
+            ):
+                return False, 'path_unknown_clearance'
+
+        return True, 'ok'
+
+    def _reject_pending_path_candidate(
+        self,
+        reason: str,
+        record_path_failure: bool = True,
+    ):
         candidate = self.pending_candidate
         candidate_index = self.pending_candidate_index
         self.path_check_active = False
         self.pending_candidate = None
         self.pending_goal_pose = None
-        start_or_costmap_blocked = self._record_path_failure()
+        start_or_costmap_blocked = False
+        if record_path_failure:
+            start_or_costmap_blocked = self._record_path_failure()
 
         if start_or_costmap_blocked:
             self.get_logger().warn(
@@ -1258,8 +1330,9 @@ class ActiveSlamNode(Node):
             self.pending_candidates_queue = []
             self._start_costmap_recovery('repeated_path_failures')
         elif candidate is not None:
-            self.last_candidate_rejections['no_path'] = (
-                self.last_candidate_rejections.get('no_path', 0) + 1
+            rejection_key = 'unsafe_path' if reason.startswith('path_') else 'no_path'
+            self.last_candidate_rejections[rejection_key] = (
+                self.last_candidate_rejections.get(rejection_key, 0) + 1
             )
             self._blacklist_goal_xy(candidate.goal_xy)
             self.get_logger().warn(

@@ -49,9 +49,12 @@ active_slam_node:
     min_goal_distance_m: 0.80
     # Keep goals close so mapping expands sequentially instead of jumping far ahead.
     max_goal_distance_m: 5.0
-    goal_clearance_radius_m: 0.25
-    unknown_clearance_radius_m: 0.05
-    goal_backoff_m: 0.25
+    goal_clearance_radius_m: 0.35
+    unknown_clearance_radius_m: 0.10
+    path_clearance_radius_m: 0.35
+    path_unknown_clearance_radius_m: 0.05
+    path_check_stride: 2
+    goal_backoff_m: 0.35
     same_goal_tolerance_m: 1.00
 
     # Stronger distance penalty favors nearby frontiers while preserving entropy scoring.
