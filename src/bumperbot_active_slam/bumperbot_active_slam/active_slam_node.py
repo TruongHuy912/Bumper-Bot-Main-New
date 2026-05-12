@@ -3,9 +3,16 @@
 from collections import deque
 from dataclasses import dataclass
 import math
-from typing import List, Optional, Sequence, Tuple
+import time
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+try:
+    from scipy.ndimage import distance_transform_edt, uniform_filter
+except ImportError:
+    distance_transform_edt = None
+    uniform_filter = None
 
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import Point, PoseStamped, Twist
@@ -74,11 +81,17 @@ class ActiveSlamNode(Node):
         )
 
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(
-            self.tf_buffer,
-            self,
-            spin_thread=True,
-        )
+        try:
+            self.tf_listener = TransformListener(
+                self.tf_buffer,
+                self,
+                spin_thread=True,
+            )
+        except TypeError:
+            self.tf_listener = TransformListener(self.tf_buffer, self)
+            self.get_logger().warn(
+                'TransformListener spin_thread is not supported; using default listener.'
+            )
 
         self.nav_client = ActionClient(
             self,
@@ -111,6 +124,8 @@ class ActiveSlamNode(Node):
         self.pending_candidate: Optional[FrontierCandidate] = None
         self.recovery_spin_until_sec = 0.0
         self.recovery_spin_active = False
+        self.last_too_close_recovery_time_sec = 0.0
+        self.consecutive_too_close_spins = 0
         self.path_failure_times: List[float] = []
         self.path_failure_pause_until_sec = 0.0
         self.pending_candidates_queue: List[FrontierCandidate] = []
@@ -125,6 +140,8 @@ class ActiveSlamNode(Node):
         self.costmap_recovery_reason = ''
         self.last_robot_xy: Optional[WorldPoint] = None
         self.last_robot_pose_time_sec: Optional[float] = None
+        self.map_helpers = {}
+        self.last_timing_log_time_sec = 0.0
 
         self.last_sent_goal_xy: Optional[WorldPoint] = None
         self.last_goal_done_time = self.get_clock().now()
@@ -184,19 +201,33 @@ class ActiveSlamNode(Node):
         self.declare_parameter('tf_lookup_timeout_sec', 0.05)
         self.declare_parameter('use_last_pose_on_tf_failure', True)
         self.declare_parameter('max_cached_pose_age_sec', 2.0)
-        self.declare_parameter('enable_recovery_spin', True)
-        self.declare_parameter('recovery_spin_duration_sec', 4.0)
-        self.declare_parameter('recovery_spin_angular_vel', 0.35)
+        self.declare_parameter('enable_recovery_spin', False)
+        self.declare_parameter('enable_too_close_recovery_spin', False)
+        self.declare_parameter('too_close_recovery_cooldown_sec', 15.0)
+        self.declare_parameter('max_consecutive_too_close_spins', 1)
+        self.declare_parameter('recovery_spin_duration_sec', 1.5)
+        self.declare_parameter('recovery_spin_angular_vel', 0.15)
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
-        self.declare_parameter('too_close_recovery_threshold', 1)
+        self.declare_parameter('too_close_recovery_threshold', 999)
         self.declare_parameter('path_failure_threshold', 3)
         self.declare_parameter('path_failure_window_sec', 30.0)
         self.declare_parameter('path_failure_pause_sec', 0.0)
-        self.declare_parameter('max_path_check_attempts_per_cycle', 5)
-        self.declare_parameter('visited_goal_radius_m', 0.90)
+        self.declare_parameter('max_path_check_attempts_per_cycle', 3)
+        self.declare_parameter('enable_timing_debug', True)
+        self.declare_parameter('timing_log_period_sec', 5.0)
+        self.declare_parameter('max_clusters_to_score', 8)
+        self.declare_parameter('max_seed_cells_per_cluster', 6)
+        self.declare_parameter('max_total_candidates', 40)
+        self.declare_parameter('adaptive_goal_distance_enabled', True)
+        self.declare_parameter('max_goal_distance_hard_m', 8.0)
+        self.declare_parameter('goal_distance_expand_step_m', 1.0)
+        self.declare_parameter('cluster_distance_weight', 0.7)
+        self.declare_parameter('cluster_size_weight', 0.3)
+        self.declare_parameter('cluster_distance_sample_count', 20)
+        self.declare_parameter('visited_goal_radius_m', 0.80)
         self.declare_parameter('visited_goal_duration_sec', 180.0)
         self.declare_parameter('max_visited_goals', 50)
-        self.declare_parameter('nav_xy_goal_tolerance_m', 0.25)
+        self.declare_parameter('nav_xy_goal_tolerance_m', 0.20)
         self.declare_parameter('min_goal_distance_margin_m', 0.25)
         self.declare_parameter('enable_stuck_watchdog', True)
         self.declare_parameter('stuck_check_radius_m', 0.15)
@@ -210,14 +241,14 @@ class ActiveSlamNode(Node):
             'clear_local_costmap_service',
             '/local_costmap/clear_entirely_local_costmap',
         )
-        self.declare_parameter('recovery_backup_duration_sec', 2.0)
-        self.declare_parameter('recovery_backup_linear_vel', -0.05)
+        self.declare_parameter('recovery_backup_duration_sec', 0.0)
+        self.declare_parameter('recovery_backup_linear_vel', -0.03)
         self.declare_parameter('recovery_wait_after_clear_sec', 1.0)
 
         self.declare_parameter('control_period_sec', 1.0)
         self.declare_parameter('goal_cooldown_sec', 1.0)
-        self.declare_parameter('blacklist_duration_sec', 30.0)
-        self.declare_parameter('blacklist_radius_m', 0.50)
+        self.declare_parameter('blacklist_duration_sec', 45.0)
+        self.declare_parameter('blacklist_radius_m', 0.60)
         self.declare_parameter('nav_timeout_sec', 0.0)
         self.declare_parameter('min_free_cells_before_start', 200)
 
@@ -226,25 +257,26 @@ class ActiveSlamNode(Node):
         self.declare_parameter('occupied_min_value', 65)
 
         self.declare_parameter('min_frontier_cells', 20)
-        self.declare_parameter('min_goal_distance_m', 0.80)
-        self.declare_parameter('max_goal_distance_m', 5.0)
+        self.declare_parameter('min_goal_distance_m', 0.60)
+        self.declare_parameter('max_goal_distance_m', 7.0)
         self.declare_parameter('goal_clearance_radius_m', 0.35)
         self.declare_parameter('unknown_clearance_radius_m', 0.10)
         self.declare_parameter('path_clearance_radius_m', 0.30)
         self.declare_parameter('path_unknown_clearance_radius_m', 0.0)
-        self.declare_parameter('path_check_stride', 2)
+        self.declare_parameter('path_check_stride', 3)
         self.declare_parameter('allow_unknown_path_cells', True)
         self.declare_parameter('allow_uncertain_path_cells', True)
-        self.declare_parameter('goal_backoff_m', 0.35)
-        self.declare_parameter('same_goal_tolerance_m', 1.00)
+        self.declare_parameter('goal_backoff_m', 0.20)
+        self.declare_parameter('same_goal_tolerance_m', 0.80)
 
-        self.declare_parameter('lambda_distance', 0.18)
+        self.declare_parameter('lambda_distance', 0.15)
         self.declare_parameter('entropy_weight', 1.0)
         self.declare_parameter('frontier_size_weight', 0.02)
         self.declare_parameter('frontier_size_norm_cells', 100.0)
-        self.declare_parameter('entropy_neighborhood_radius_cells', 2)
+        self.declare_parameter('entropy_neighborhood_radius_cells', 1)
 
         self.declare_parameter('publish_markers', True)
+        self.declare_parameter('max_marker_frontier_points', 1500)
         self.declare_parameter('marker_topic', '/active_slam/frontiers')
         self.declare_parameter('selected_goal_topic', '/active_slam/selected_goal')
         self.declare_parameter('status_topic', '/active_slam/status')
@@ -275,6 +307,15 @@ class ActiveSlamNode(Node):
         self.enable_recovery_spin = bool(
             self.get_parameter('enable_recovery_spin').value
         )
+        self.enable_too_close_recovery_spin = bool(
+            self.get_parameter('enable_too_close_recovery_spin').value
+        )
+        self.too_close_recovery_cooldown_sec = float(
+            self.get_parameter('too_close_recovery_cooldown_sec').value
+        )
+        self.max_consecutive_too_close_spins = int(
+            self.get_parameter('max_consecutive_too_close_spins').value
+        )
         self.recovery_spin_duration_sec = float(
             self.get_parameter('recovery_spin_duration_sec').value
         )
@@ -296,6 +337,39 @@ class ActiveSlamNode(Node):
         )
         self.max_path_check_attempts_per_cycle = int(
             self.get_parameter('max_path_check_attempts_per_cycle').value
+        )
+        self.enable_timing_debug = bool(
+            self.get_parameter('enable_timing_debug').value
+        )
+        self.timing_log_period_sec = float(
+            self.get_parameter('timing_log_period_sec').value
+        )
+        self.max_clusters_to_score = int(
+            self.get_parameter('max_clusters_to_score').value
+        )
+        self.max_seed_cells_per_cluster = int(
+            self.get_parameter('max_seed_cells_per_cluster').value
+        )
+        self.max_total_candidates = int(
+            self.get_parameter('max_total_candidates').value
+        )
+        self.adaptive_goal_distance_enabled = bool(
+            self.get_parameter('adaptive_goal_distance_enabled').value
+        )
+        self.max_goal_distance_hard_m = float(
+            self.get_parameter('max_goal_distance_hard_m').value
+        )
+        self.goal_distance_expand_step_m = float(
+            self.get_parameter('goal_distance_expand_step_m').value
+        )
+        self.cluster_distance_weight = float(
+            self.get_parameter('cluster_distance_weight').value
+        )
+        self.cluster_size_weight = float(
+            self.get_parameter('cluster_size_weight').value
+        )
+        self.cluster_distance_sample_count = int(
+            self.get_parameter('cluster_distance_sample_count').value
         )
         self.visited_goal_radius_m = float(
             self.get_parameter('visited_goal_radius_m').value
@@ -421,6 +495,9 @@ class ActiveSlamNode(Node):
         self.publish_markers = bool(
             self.get_parameter('publish_markers').value
         )
+        self.max_marker_frontier_points = int(
+            self.get_parameter('max_marker_frontier_points').value
+        )
         self.marker_topic = self.get_parameter('marker_topic').value
         self.selected_goal_topic = self.get_parameter(
             'selected_goal_topic'
@@ -508,7 +585,16 @@ class ActiveSlamNode(Node):
             if expires_at > now_sec
         ]
 
+        timings = {}
+        total_start = time.perf_counter()
+
+        step_start = time.perf_counter()
         grid = self._map_to_numpy(self.map_msg)
+        timings['map'] = self._elapsed_ms(step_start)
+
+        step_start = time.perf_counter()
+        self.map_helpers = self._precompute_map_helpers(grid)
+        timings['precompute'] = self._elapsed_ms(step_start)
 
         free_cells = int(np.sum((grid >= 0) & (grid <= self.free_max_value)))
         if free_cells < self.min_free_cells_before_start:
@@ -526,24 +612,58 @@ class ActiveSlamNode(Node):
             self._publish_status('ROBOT_OUT_OF_MAP')
             return
 
+        step_start = time.perf_counter()
         frontier_mask = self._detect_frontier_mask(grid)
+        timings['frontier'] = self._elapsed_ms(step_start)
+
+        step_start = time.perf_counter()
         clusters = self._cluster_frontiers(frontier_mask)
+        ranked_clusters = self._rank_frontier_clusters(clusters, robot_xy)
+        scored_clusters = ranked_clusters[:self.max_clusters_to_score]
+        timings['cluster'] = self._elapsed_ms(step_start)
+
+        step_start = time.perf_counter()
         candidates = self._build_candidates(
             grid,
-            clusters,
+            scored_clusters,
             robot_xy,
             robot_cell,
         )
+        if not candidates and self._too_far_rejections_dominate():
+            candidates = self._build_candidates_with_expanded_goal_distance(
+                grid,
+                scored_clusters,
+                robot_xy,
+                robot_cell,
+            )
+        timings['candidates'] = self._elapsed_ms(step_start)
 
         if self.publish_markers:
+            step_start = time.perf_counter()
             self._publish_markers(clusters, candidates)
+            timings['markers'] = self._elapsed_ms(step_start)
+        else:
+            timings['markers'] = 0.0
 
         if not clusters:
+            timings['sort'] = 0.0
+            timings['start_checks'] = 0.0
+            timings['total'] = self._elapsed_ms(total_start)
+            self._maybe_log_goal_timing(timings, len(clusters), len(candidates))
             self._publish_status('NO_FRONTIER_FOUND')
             return
 
         if not candidates:
-            if self._should_start_recovery_spin():
+            timings['sort'] = 0.0
+            timings['start_checks'] = 0.0
+            timings['total'] = self._elapsed_ms(total_start)
+            self._maybe_log_goal_timing(timings, len(clusters), len(candidates))
+            rejection_summary = self._format_rejections()
+            if self._should_start_recovery_spin('too_close_frontier'):
+                self._publish_status(
+                    'NO_VALID_FRONTIER clusters=%d %s'
+                    % (len(clusters), rejection_summary)
+                )
                 self._start_recovery_spin('too_close_frontier')
                 return
 
@@ -555,13 +675,31 @@ class ActiveSlamNode(Node):
                     period_sec=10.0,
                 )
 
+            if self._too_close_rejections_dominate():
+                self._warn_throttled(
+                    'frontiers_too_close',
+                    'No valid frontier candidates because frontiers are too close: %s'
+                    % rejection_summary,
+                    period_sec=5.0,
+                )
+                self._publish_status(
+                    'NO_VALID_FRONTIER_TOO_CLOSE clusters=%d %s'
+                    % (len(clusters), rejection_summary)
+                )
+                return
+
             self._publish_status(
                 'NO_VALID_FRONTIER clusters=%d %s'
-                % (len(clusters), self._format_rejections())
+                % (len(clusters), rejection_summary)
             )
             return
 
+        step_start = time.perf_counter()
         candidates.sort(key=lambda candidate: candidate.utility, reverse=True)
+        if len(candidates) > self.max_total_candidates:
+            candidates = candidates[:self.max_total_candidates]
+        self.consecutive_too_close_spins = 0
+        timings['sort'] = self._elapsed_ms(step_start)
         self._log_top_candidates(candidates)
 
         if self.enable_compute_path_check:
@@ -573,7 +711,11 @@ class ActiveSlamNode(Node):
                     % self.compute_path_action_name,
                 )
                 return
+            step_start = time.perf_counter()
             self._start_candidate_path_checks(candidates, robot_xy)
+            timings['start_checks'] = self._elapsed_ms(step_start)
+            timings['total'] = self._elapsed_ms(total_start)
+            self._maybe_log_goal_timing(timings, len(clusters), len(candidates))
             return
 
         selected = self._select_candidate(candidates)
@@ -586,6 +728,9 @@ class ActiveSlamNode(Node):
         self.selected_goal_pub.publish(goal_pose)
 
         self._send_nav_goal(goal_pose, selected)
+        timings['start_checks'] = 0.0
+        timings['total'] = self._elapsed_ms(total_start)
+        self._maybe_log_goal_timing(timings, len(clusters), len(candidates))
 
     def _lookup_robot_xy(self) -> Optional[WorldPoint]:
         query_time = rclpy.time.Time()
@@ -639,6 +784,87 @@ class ActiveSlamNode(Node):
         return np.array(msg.data, dtype=np.int16).reshape(
             (msg.info.height, msg.info.width)
         )
+
+    def _elapsed_ms(self, start_time: float) -> float:
+        return (time.perf_counter() - start_time) * 1000.0
+
+    def _maybe_log_goal_timing(
+        self,
+        timings: Dict[str, float],
+        cluster_count: int,
+        candidate_count: int,
+    ):
+        if not self.enable_timing_debug:
+            return
+
+        now_sec = self._now_seconds()
+        if now_sec - self.last_timing_log_time_sec < self.timing_log_period_sec:
+            return
+
+        self.last_timing_log_time_sec = now_sec
+        self.get_logger().info(
+            'Goal computation timing: map=%.1fms precompute=%.1fms '
+            'frontier=%.1fms cluster=%.1fms candidates=%.1fms sort=%.1fms '
+            'markers=%.1fms start_checks=%.1fms total=%.1fms clusters=%d candidates=%d'
+            % (
+                timings.get('map', 0.0),
+                timings.get('precompute', 0.0),
+                timings.get('frontier', 0.0),
+                timings.get('cluster', 0.0),
+                timings.get('candidates', 0.0),
+                timings.get('sort', 0.0),
+                timings.get('markers', 0.0),
+                timings.get('start_checks', 0.0),
+                timings.get('total', 0.0),
+                cluster_count,
+                candidate_count,
+            )
+        )
+
+    def _precompute_map_helpers(self, grid: np.ndarray) -> Dict[str, np.ndarray]:
+        resolution = self.map_msg.info.resolution
+        occupied_mask = grid >= self.occupied_min_value
+        unknown_mask = grid == self.unknown_value
+
+        helpers = {
+            'occupied_mask': occupied_mask,
+            'unknown_mask': unknown_mask,
+            'entropy_grid': self._build_entropy_grid(grid),
+        }
+
+        if distance_transform_edt is not None:
+            helpers['occupied_distance_m'] = (
+                distance_transform_edt(~occupied_mask) * resolution
+            )
+            helpers['unknown_distance_m'] = (
+                distance_transform_edt(~unknown_mask) * resolution
+            )
+
+        entropy_grid = helpers['entropy_grid']
+        radius = max(0, self.entropy_neighborhood_radius_cells)
+        if uniform_filter is not None and radius > 0:
+            helpers['entropy_smooth_grid'] = uniform_filter(
+                entropy_grid,
+                size=radius * 2 + 1,
+                mode='nearest',
+            )
+        else:
+            helpers['entropy_smooth_grid'] = entropy_grid
+
+        return helpers
+
+    def _build_entropy_grid(self, grid: np.ndarray) -> np.ndarray:
+        probabilities = np.where(
+            grid == self.unknown_value,
+            0.5,
+            np.clip(grid.astype(np.float32) / 100.0, 1e-3, 1.0 - 1e-3),
+        )
+        entropy_grid = (
+            -probabilities * np.log(probabilities)
+            - (1.0 - probabilities) * np.log(1.0 - probabilities)
+        ) / math.log(2.0)
+        entropy_grid[grid >= self.occupied_min_value] = 0.0
+        return entropy_grid.astype(np.float32)
 
     def _detect_frontier_mask(self, grid: np.ndarray) -> np.ndarray:
         free = (grid >= 0) & (grid <= self.free_max_value)
@@ -702,13 +928,81 @@ class ActiveSlamNode(Node):
 
         return clusters
 
+    def _rank_frontier_clusters(
+        self,
+        clusters: Sequence[List[GridCell]],
+        robot_xy: WorldPoint,
+    ) -> List[List[GridCell]]:
+        scored_clusters = []
+
+        for cluster in clusters:
+            min_distance_m = self._min_distance_to_cluster(cluster, robot_xy)
+            distance_score = math.exp(-self.lambda_distance * min_distance_m)
+            size_score = min(len(cluster) / self.frontier_size_norm_cells, 1.0)
+            cluster_score = (
+                self.cluster_distance_weight * distance_score
+                + self.cluster_size_weight * size_score
+            )
+            scored_clusters.append((cluster_score, min_distance_m, len(cluster), cluster))
+
+        scored_clusters.sort(key=lambda item: item[0], reverse=True)
+        self._log_top_clusters(scored_clusters)
+        return [cluster for _, _, _, cluster in scored_clusters]
+
+    def _min_distance_to_cluster(
+        self,
+        cluster: Sequence[GridCell],
+        robot_xy: WorldPoint,
+    ) -> float:
+        if not cluster:
+            return float('inf')
+
+        sample_count = max(1, self.cluster_distance_sample_count)
+        if len(cluster) <= sample_count:
+            sampled_cells = cluster
+        else:
+            step = max(1, len(cluster) // sample_count)
+            sampled_cells = cluster[::step][:sample_count]
+
+        min_distance_m = float('inf')
+        for cell in sampled_cells:
+            cell_xy = self._map_to_world(cell[0], cell[1], self.map_msg)
+            min_distance_m = min(min_distance_m, self._distance(cell_xy, robot_xy))
+
+        return min_distance_m
+
+    def _log_top_clusters(self, scored_clusters, limit: int = 5):
+        if not scored_clusters or not self.enable_timing_debug:
+            return
+
+        now_sec = self._now_seconds()
+        last = self._last_warn_time.get('top_clusters')
+        if last is not None and now_sec - last < self.timing_log_period_sec:
+            return
+
+        self._last_warn_time['top_clusters'] = now_sec
+        parts = []
+        for i, (score, distance_m, size, _) in enumerate(scored_clusters[:limit]):
+            parts.append(
+                '#%d score=%.3f d=%.2f size=%d'
+                % (i + 1, score, distance_m, size)
+            )
+
+        self.get_logger().info('Top clusters: ' + ' | '.join(parts))
+
     def _build_candidates(
         self,
         grid: np.ndarray,
         clusters: Sequence[List[GridCell]],
         robot_xy: WorldPoint,
         robot_cell: GridCell,
+        max_goal_distance_m: Optional[float] = None,
     ) -> List[FrontierCandidate]:
+        search_max_goal_distance_m = (
+            self.max_goal_distance_m
+            if max_goal_distance_m is None
+            else max_goal_distance_m
+        )
         candidates: List[FrontierCandidate] = []
         rejections = {
             'out_of_map': 0,
@@ -725,6 +1019,7 @@ class ActiveSlamNode(Node):
             'duplicate': 0,
         }
         seen_goal_cells = set()
+        effective_min_distance = self._effective_min_goal_distance()
 
         for cluster in clusters:
             for representative_cell in self._cluster_seed_cells(cluster):
@@ -735,6 +1030,24 @@ class ActiveSlamNode(Node):
                 )
 
                 backed_xy = self._backoff_goal(representative_xy, robot_xy)
+
+                preliminary_distance_m = math.hypot(
+                    backed_xy[0] - robot_xy[0],
+                    backed_xy[1] - robot_xy[1],
+                )
+                if preliminary_distance_m < effective_min_distance:
+                    rejections['too_close'] += 1
+                    continue
+                if preliminary_distance_m > search_max_goal_distance_m + 0.5:
+                    rejections['too_far'] += 1
+                    continue
+                if self._is_blacklisted(backed_xy):
+                    rejections['blacklisted'] += 1
+                    continue
+                if self._is_visited_goal(backed_xy):
+                    rejections['visited'] += 1
+                    continue
+
                 backed_cell = self._world_to_map(
                     backed_xy[0],
                     backed_xy[1],
@@ -769,6 +1082,7 @@ class ActiveSlamNode(Node):
                     goal_cell,
                     grid,
                     distance_m,
+                    search_max_goal_distance_m,
                 )
                 if rejection_reason is not None:
                     rejections[rejection_reason] += 1
@@ -816,7 +1130,52 @@ class ActiveSlamNode(Node):
                     )
                 )
 
+        if len(candidates) > self.max_total_candidates:
+            candidates.sort(key=lambda candidate: candidate.utility, reverse=True)
+            candidates = candidates[:self.max_total_candidates]
+
         self.last_candidate_rejections = rejections
+        return candidates
+
+    def _build_candidates_with_expanded_goal_distance(
+        self,
+        grid: np.ndarray,
+        clusters: Sequence[List[GridCell]],
+        robot_xy: WorldPoint,
+        robot_cell: GridCell,
+    ) -> List[FrontierCandidate]:
+        if not self.adaptive_goal_distance_enabled:
+            return []
+
+        candidates: List[FrontierCandidate] = []
+        current_max_distance_m = self.max_goal_distance_m
+        hard_limit_m = max(self.max_goal_distance_m, self.max_goal_distance_hard_m)
+
+        for _ in range(3):
+            if current_max_distance_m >= hard_limit_m:
+                break
+
+            expanded_max_distance_m = min(
+                current_max_distance_m + self.goal_distance_expand_step_m,
+                hard_limit_m,
+            )
+            self.get_logger().warn(
+                'Expanding goal search radius from %.1f to %.1f because all candidates are too far.'
+                % (current_max_distance_m, expanded_max_distance_m)
+            )
+
+            candidates = self._build_candidates(
+                grid,
+                clusters,
+                robot_xy,
+                robot_cell,
+                max_goal_distance_m=expanded_max_distance_m,
+            )
+            current_max_distance_m = expanded_max_distance_m
+
+            if candidates or not self._too_far_rejections_dominate():
+                break
+
         return candidates
 
     def _cluster_seed_cells(self, cluster: Sequence[GridCell]) -> List[GridCell]:
@@ -831,11 +1190,8 @@ class ActiveSlamNode(Node):
             ),
         )
 
-        if len(sorted_cells) <= 24:
-            return list(sorted_cells)
-
-        step = max(1, len(sorted_cells) // 24)
-        return sorted_cells[:12] + sorted_cells[12::step][:12]
+        max_seeds = max(1, self.max_seed_cells_per_cluster)
+        return list(sorted_cells[:max_seeds])
 
     def _backoff_goal(
         self,
@@ -881,7 +1237,7 @@ class ActiveSlamNode(Node):
             if not self._in_bounds(cell, grid) or not self._is_free_cell(cell, grid):
                 return
 
-            if not self._has_occupied_clearance(
+            if not self._has_occupied_clearance_fast(
                 cell,
                 grid,
                 self.goal_clearance_radius_m,
@@ -894,7 +1250,7 @@ class ActiveSlamNode(Node):
                 best_occupied_only = cell
                 best_occupied_score = score
 
-            if not self._has_unknown_clearance(
+            if not self._has_unknown_clearance_fast(
                 cell,
                 grid,
                 self.unknown_clearance_radius_m,
@@ -918,6 +1274,35 @@ class ActiveSlamNode(Node):
             return best_with_unknown_clearance
 
         return best_occupied_only
+
+    def _has_occupied_clearance_fast(
+        self,
+        cell: GridCell,
+        grid: np.ndarray,
+        clearance_m: float,
+    ) -> bool:
+        distance_grid = self.map_helpers.get('occupied_distance_m')
+        if distance_grid is None:
+            return self._has_occupied_clearance(cell, grid, clearance_m)
+
+        x, y = cell
+        return float(distance_grid[y, x]) >= clearance_m
+
+    def _has_unknown_clearance_fast(
+        self,
+        cell: GridCell,
+        grid: np.ndarray,
+        clearance_m: float,
+    ) -> bool:
+        if clearance_m <= 0.0:
+            return True
+
+        distance_grid = self.map_helpers.get('unknown_distance_m')
+        if distance_grid is None:
+            return self._has_unknown_clearance(cell, grid, clearance_m)
+
+        x, y = cell
+        return float(distance_grid[y, x]) >= clearance_m
 
     def _has_occupied_clearance(
         self,
@@ -981,16 +1366,19 @@ class ActiveSlamNode(Node):
         goal_cell: GridCell,
         grid: np.ndarray,
         distance_m: float,
+        max_goal_distance_m: Optional[float] = None,
     ) -> Optional[str]:
-        effective_min_distance = max(
-            self.min_goal_distance_m,
-            self.nav_xy_goal_tolerance_m + self.min_goal_distance_margin_m,
+        effective_min_distance = self._effective_min_goal_distance()
+        search_max_goal_distance_m = (
+            self.max_goal_distance_m
+            if max_goal_distance_m is None
+            else max_goal_distance_m
         )
 
         if distance_m < effective_min_distance:
             return 'too_close'
 
-        if distance_m > self.max_goal_distance_m:
+        if distance_m > search_max_goal_distance_m:
             return 'too_far'
 
         if not self._in_bounds(goal_cell, grid):
@@ -999,14 +1387,14 @@ class ActiveSlamNode(Node):
         if not self._is_free_cell(goal_cell, grid):
             return 'unsafe'
 
-        if not self._has_occupied_clearance(
+        if not self._has_occupied_clearance_fast(
             goal_cell,
             grid,
             self.goal_clearance_radius_m,
         ):
             return 'unsafe_clearance'
 
-        if not self._has_unknown_clearance(
+        if not self._has_unknown_clearance_fast(
             goal_cell,
             grid,
             self.unknown_clearance_radius_m,
@@ -1015,13 +1403,19 @@ class ActiveSlamNode(Node):
 
         return None
 
+    def _effective_min_goal_distance(self) -> float:
+        return max(
+            self.min_goal_distance_m,
+            self.nav_xy_goal_tolerance_m + self.min_goal_distance_margin_m,
+        )
+
     def _path_entropy(
         self,
         path_cells: Sequence[GridCell],
         grid: np.ndarray,
     ) -> Optional[float]:
         entropy_values = []
-        radius = max(0, self.entropy_neighborhood_radius_cells)
+        entropy_grid = self.map_helpers.get('entropy_smooth_grid')
 
         for cell in path_cells:
             if not self._in_bounds(cell, grid):
@@ -1033,23 +1427,10 @@ class ActiveSlamNode(Node):
             if value != self.unknown_value and value >= self.occupied_min_value:
                 continue
 
-            for ny in range(y - radius, y + radius + 1):
-                for nx in range(x - radius, x + radius + 1):
-                    if not self._in_bounds((nx, ny), grid):
-                        continue
-
-                    neighbor_value = int(grid[ny, nx])
-
-                    # Không cộng entropy của obstacle quanh line.
-                    if (
-                        neighbor_value != self.unknown_value
-                        and neighbor_value >= self.occupied_min_value
-                    ):
-                        continue
-
-                    entropy_values.append(
-                        self._cell_entropy(neighbor_value)
-                    )
+            if entropy_grid is not None:
+                entropy_values.append(float(entropy_grid[y, x]))
+            else:
+                entropy_values.append(self._cell_entropy(value))
 
         if not entropy_values:
             return 0.0
@@ -1271,7 +1652,7 @@ class ActiveSlamNode(Node):
             )
             self._reject_pending_path_candidate(
                 path_rejection_reason,
-                record_path_failure=False,
+                count_as_path_failure=False,
             )
             return
 
@@ -1303,6 +1684,7 @@ class ActiveSlamNode(Node):
             return False, 'no_map'
 
         grid = self._map_to_numpy(self.map_msg)
+        self.map_helpers = self._precompute_map_helpers(grid)
         stride = max(1, self.path_check_stride)
         pose_count = len(path.poses)
 
@@ -1317,22 +1699,11 @@ class ActiveSlamNode(Node):
             if cell is None:
                 return False, 'path_out_of_map'
 
-            x_cell, y_cell = cell
-            cell_value = int(grid[y_cell, x_cell])
+            traversable, reason = self._is_path_cell_traversable(cell, grid)
+            if not traversable:
+                return False, reason
 
-            if cell_value >= self.occupied_min_value:
-                return False, 'path_occupied'
-
-            if cell_value == self.unknown_value and not self.allow_unknown_path_cells:
-                return False, 'path_unknown'
-
-            if (
-                self.free_max_value < cell_value < self.occupied_min_value
-                and not self.allow_uncertain_path_cells
-            ):
-                return False, 'path_not_free'
-
-            if not self._has_occupied_clearance(
+            if not self._has_occupied_clearance_fast(
                 cell,
                 grid,
                 self.path_clearance_radius_m,
@@ -1340,7 +1711,7 @@ class ActiveSlamNode(Node):
                 return False, 'path_occupied_clearance'
 
             if self.path_unknown_clearance_radius_m > 0.0:
-                if not self._has_unknown_clearance(
+                if not self._has_unknown_clearance_fast(
                     cell,
                     grid,
                     self.path_unknown_clearance_radius_m,
@@ -1349,10 +1720,31 @@ class ActiveSlamNode(Node):
 
         return True, 'ok'
 
+    def _is_path_cell_traversable(
+        self,
+        cell: GridCell,
+        grid: np.ndarray,
+    ) -> Tuple[bool, str]:
+        x, y = cell
+        value = int(grid[y, x])
+
+        if value == self.unknown_value:
+            if self.allow_unknown_path_cells:
+                return True, 'unknown_allowed'
+            return False, 'path_unknown_cell'
+
+        if value >= self.occupied_min_value:
+            return False, 'path_occupied_cell'
+
+        if value > self.free_max_value and not self.allow_uncertain_path_cells:
+            return False, 'path_uncertain_cell'
+
+        return True, 'ok'
+
     def _reject_pending_path_candidate(
         self,
         reason: str,
-        record_path_failure: bool = True,
+        count_as_path_failure: bool = True,
     ):
         candidate = self.pending_candidate
         candidate_index = self.pending_candidate_index
@@ -1360,13 +1752,14 @@ class ActiveSlamNode(Node):
         self.pending_candidate = None
         self.pending_goal_pose = None
         start_or_costmap_blocked = False
-        if record_path_failure:
+        if count_as_path_failure:
             start_or_costmap_blocked = self._record_path_failure()
 
         if start_or_costmap_blocked:
             self.get_logger().warn(
                 'Repeated path failures, assuming robot start or costmap is blocked. '
-                'Check footprint/robot_radius and laser self-hit if this persists.'
+                'Check RViz local_costmap around robot, robot_radius/footprint, '
+                'laser self-hit, and obstacle_layer footprint clearing.'
             )
             self._publish_status('START_IN_LETHAL_OR_COSTMAP_BLOCKED')
             self.pending_candidates_queue = []
@@ -1432,7 +1825,9 @@ class ActiveSlamNode(Node):
         self._clear_costmaps()
         self._publish_status('COSTMAP_RECOVERY_CLEARING')
         self.get_logger().warn(
-            'Starting costmap recovery: clear local/global costmaps, backup, spin. reason=%s'
+            'Starting costmap recovery: clear local/global costmaps, light motion only. '
+            'reason=%s. Check RViz local_costmap, robot_radius/footprint, laser self-hit, '
+            'and obstacle_layer footprint clearing if this repeats.'
             % reason
         )
 
@@ -1445,6 +1840,14 @@ class ActiveSlamNode(Node):
         if self.costmap_recovery_state == 'CLEAR_COSTMAP':
             self._publish_status('COSTMAP_RECOVERY_CLEARING')
             if now_sec < self.costmap_recovery_until_sec:
+                return True
+
+            if self.recovery_backup_duration_sec <= 0.0:
+                self.costmap_recovery_state = 'SPIN'
+                self.costmap_recovery_until_sec = (
+                    now_sec + self.recovery_spin_duration_sec
+                )
+                self.get_logger().warn('Costmap recovery backup skipped')
                 return True
 
             self.costmap_recovery_state = 'BACKUP'
@@ -1545,12 +1948,29 @@ class ActiveSlamNode(Node):
             % (moved, self.stuck_check_radius_m, self.stuck_timeout_sec)
         )
 
-    def _should_start_recovery_spin(self) -> bool:
+    def _should_start_recovery_spin(self, reason: str) -> bool:
         if not self.enable_recovery_spin:
             return False
 
         if self.goal_active or self.path_check_active:
             return False
+
+        if reason == 'too_close_frontier':
+            if not self.enable_too_close_recovery_spin:
+                return False
+
+            now_sec = self._now_seconds()
+            if (
+                now_sec - self.last_too_close_recovery_time_sec
+                < self.too_close_recovery_cooldown_sec
+            ):
+                return False
+
+            if (
+                self.consecutive_too_close_spins
+                >= self.max_consecutive_too_close_spins
+            ):
+                return False
 
         too_close = self.last_candidate_rejections.get('too_close', 0)
         if too_close < self.too_close_recovery_threshold:
@@ -1569,6 +1989,9 @@ class ActiveSlamNode(Node):
         self.recovery_spin_until_sec = (
             self._now_seconds() + self.recovery_spin_duration_sec
         )
+        if reason == 'too_close_frontier':
+            self.last_too_close_recovery_time_sec = self._now_seconds()
+            self.consecutive_too_close_spins += 1
         self._publish_status('RECOVERY_SPIN reason=%s' % reason)
         self.get_logger().warn(
             'Starting recovery spin for %.1f sec at %.2f rad/s: %s'
@@ -1607,6 +2030,7 @@ class ActiveSlamNode(Node):
         self.current_goal_handle = None
         self.goal_start_time_sec = None
         self.last_sent_goal_xy = candidate.goal_xy
+        self.consecutive_too_close_spins = 0
         self.last_progress_xy = None
         self.last_progress_time_sec = self._now_seconds()
         self.pending_candidates_queue = []
@@ -1857,10 +2281,17 @@ class ActiveSlamNode(Node):
         frontier_marker.scale.z = 0.04
         frontier_marker.color = ColorRGBA(r=0.0, g=0.9, b=1.0, a=0.9)
 
-        for cluster in clusters:
-            for cell in cluster:
-                x, y = self._map_to_world(cell[0], cell[1], self.map_msg)
-                frontier_marker.points.append(Point(x=x, y=y, z=0.03))
+        frontier_cells = [cell for cluster in clusters for cell in cluster]
+        if (
+            self.max_marker_frontier_points > 0
+            and len(frontier_cells) > self.max_marker_frontier_points
+        ):
+            step = int(math.ceil(len(frontier_cells) / self.max_marker_frontier_points))
+            frontier_cells = frontier_cells[::step]
+
+        for cell in frontier_cells:
+            x, y = self._map_to_world(cell[0], cell[1], self.map_msg)
+            frontier_marker.points.append(Point(x=x, y=y, z=0.03))
 
         marker_array.markers.append(frontier_marker)
 
@@ -2004,6 +2435,18 @@ class ActiveSlamNode(Node):
         total_rejections = sum(self.last_candidate_rejections.values())
         other_rejections = total_rejections - too_far
         return too_far >= other_rejections
+
+    def _too_close_rejections_dominate(self) -> bool:
+        if not self.last_candidate_rejections:
+            return False
+
+        too_close = self.last_candidate_rejections.get('too_close', 0)
+        if too_close <= 0:
+            return False
+
+        total_rejections = sum(self.last_candidate_rejections.values())
+        other_rejections = total_rejections - too_close
+        return too_close >= other_rejections
 
     def _world_to_map(
         self,

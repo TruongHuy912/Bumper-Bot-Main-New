@@ -12,19 +12,33 @@ active_slam_node:
     tf_lookup_timeout_sec: 0.05
     use_last_pose_on_tf_failure: true
     max_cached_pose_age_sec: 2.0
-    enable_recovery_spin: true
-    recovery_spin_duration_sec: 4.0
-    recovery_spin_angular_vel: 0.35
+    enable_recovery_spin: false
+    enable_too_close_recovery_spin: false
+    too_close_recovery_cooldown_sec: 15.0
+    max_consecutive_too_close_spins: 1
+    recovery_spin_duration_sec: 1.5
+    recovery_spin_angular_vel: 0.15
     cmd_vel_topic: /cmd_vel
-    too_close_recovery_threshold: 1
+    too_close_recovery_threshold: 999
     path_failure_threshold: 3
     path_failure_window_sec: 30.0
     path_failure_pause_sec: 0.0
-    max_path_check_attempts_per_cycle: 5
-    visited_goal_radius_m: 0.90
+    max_path_check_attempts_per_cycle: 3
+    enable_timing_debug: true
+    timing_log_period_sec: 5.0
+    max_clusters_to_score: 8
+    max_seed_cells_per_cluster: 6
+    max_total_candidates: 40
+    adaptive_goal_distance_enabled: true
+    max_goal_distance_hard_m: 8.0
+    goal_distance_expand_step_m: 1.0
+    cluster_distance_weight: 0.7
+    cluster_size_weight: 0.3
+    cluster_distance_sample_count: 20
+    visited_goal_radius_m: 0.80
     visited_goal_duration_sec: 180.0
     max_visited_goals: 50
-    nav_xy_goal_tolerance_m: 0.25
+    nav_xy_goal_tolerance_m: 0.20
     min_goal_distance_margin_m: 0.25
     enable_stuck_watchdog: true
     stuck_check_radius_m: 0.15
@@ -32,14 +46,14 @@ active_slam_node:
     enable_costmap_recovery: true
     clear_global_costmap_service: /global_costmap/clear_entirely_global_costmap
     clear_local_costmap_service: /local_costmap/clear_entirely_local_costmap
-    recovery_backup_duration_sec: 2.0
-    recovery_backup_linear_vel: -0.05
+    recovery_backup_duration_sec: 0.0
+    recovery_backup_linear_vel: -0.03
     recovery_wait_after_clear_sec: 1.0
 
     control_period_sec: 1.0
     goal_cooldown_sec: 1.0
-    blacklist_duration_sec: 30.0
-    blacklist_radius_m: 0.50
+    blacklist_duration_sec: 45.0
+    blacklist_radius_m: 0.60
     # nav_timeout_sec=0 disables hard timeout. The stuck watchdog handles real stalls.
     nav_timeout_sec: 0.0
 
@@ -48,27 +62,28 @@ active_slam_node:
     occupied_min_value: 65
 
     min_frontier_cells: 20
-    min_goal_distance_m: 0.80
+    min_goal_distance_m: 0.60
     # Keep goals close so mapping expands sequentially instead of jumping far ahead.
-    max_goal_distance_m: 5.0
+    max_goal_distance_m: 7.0
     goal_clearance_radius_m: 0.35
     unknown_clearance_radius_m: 0.10
     path_clearance_radius_m: 0.30
     path_unknown_clearance_radius_m: 0.0
-    path_check_stride: 2
+    path_check_stride: 3
     allow_unknown_path_cells: true
     allow_uncertain_path_cells: true
-    goal_backoff_m: 0.35
-    same_goal_tolerance_m: 1.00
+    goal_backoff_m: 0.20
+    same_goal_tolerance_m: 0.80
 
     # Stronger distance penalty favors nearby frontiers while preserving entropy scoring.
-    lambda_distance: 0.18
+    lambda_distance: 0.15
     entropy_weight: 1.0
     frontier_size_weight: 0.02
-    frontier_size_norm_cells: 80.0
-    entropy_neighborhood_radius_cells: 2
+    frontier_size_norm_cells: 100.0
+    entropy_neighborhood_radius_cells: 1
 
     publish_markers: true
+    max_marker_frontier_points: 1500
     marker_topic: /active_slam/frontiers
     selected_goal_topic: /active_slam/selected_goal
     status_topic: /active_slam/status
