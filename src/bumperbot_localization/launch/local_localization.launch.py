@@ -8,11 +8,16 @@ import os
 
 def generate_launch_description():
 
+    use_sim_time_arg = DeclareLaunchArgument(
+        "use_sim_time",
+        default_value="true",
+    )
     use_python_arg = DeclareLaunchArgument(
         "use_python",
         default_value="False",
     )
 
+    use_sim_time = LaunchConfiguration("use_sim_time")
     use_python = LaunchConfiguration("use_python")
 
     static_transform_publisher = Node(
@@ -29,7 +34,14 @@ def generate_launch_description():
         executable="ekf_node",
         name="ekf_filter_node",
         output="screen",
-        parameters=[os.path.join(get_package_share_directory("bumperbot_localization"), "config", "ekf.yaml")],
+        parameters=[
+            os.path.join(
+                get_package_share_directory("bumperbot_localization"),
+                "config",
+                "ekf.yaml",
+            ),
+            {"use_sim_time": use_sim_time},
+        ],
     )
 
     imu_republisher_py = Node(
@@ -45,6 +57,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        use_sim_time_arg,
         use_python_arg,
         static_transform_publisher,
         robot_localization,

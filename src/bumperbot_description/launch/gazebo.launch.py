@@ -23,6 +23,26 @@ def generate_launch_description():
     )
 
     world_name_arg = DeclareLaunchArgument(name="world_name", default_value="empty")
+    spawn_x_arg = DeclareLaunchArgument(
+        name="spawn_x",
+        default_value="-0.5",
+        description="Robot spawn x position in Gazebo world coordinates.",
+    )
+    spawn_y_arg = DeclareLaunchArgument(
+        name="spawn_y",
+        default_value="0.0",
+        description="Robot spawn y position in Gazebo world coordinates.",
+    )
+    spawn_z_arg = DeclareLaunchArgument(
+        name="spawn_z",
+        default_value="0.05",
+        description="Robot spawn z position in Gazebo world coordinates.",
+    )
+    spawn_yaw_arg = DeclareLaunchArgument(
+        name="spawn_yaw",
+        default_value="0.0",
+        description="Robot spawn yaw angle in radians.",
+    )
 
     world_path = PathJoinSubstitution([
             bumperbot_description,
@@ -71,7 +91,11 @@ def generate_launch_description():
         executable="create",
         output="screen",
         arguments=["-topic", "robot_description",
-                   "-name", "bumperbot"],
+                   "-name", "bumperbot",
+                   "-x", LaunchConfiguration("spawn_x"),
+                   "-y", LaunchConfiguration("spawn_y"),
+                   "-z", LaunchConfiguration("spawn_z"),
+                   "-Y", LaunchConfiguration("spawn_yaw")],
     )
 
     gz_ros2_bridge = Node(
@@ -90,6 +114,10 @@ def generate_launch_description():
     return LaunchDescription([
         model_arg,
         world_name_arg,
+        spawn_x_arg,
+        spawn_y_arg,
+        spawn_z_arg,
+        spawn_yaw_arg,
         gazebo_resource_path,
         robot_state_publisher_node,
         gazebo,

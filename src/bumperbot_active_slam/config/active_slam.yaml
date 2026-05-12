@@ -6,27 +6,58 @@ active_slam_node:
     global_frame: map
     robot_base_frame: base_footprint
     nav2_action_name: /navigate_to_pose
+    compute_path_action_name: /compute_path_to_pose
+    enable_compute_path_check: true
+    min_path_poses: 2
+    tf_lookup_timeout_sec: 1.0
+    enable_recovery_spin: true
+    recovery_spin_duration_sec: 4.0
+    recovery_spin_angular_vel: 0.35
+    cmd_vel_topic: /cmd_vel
+    too_close_recovery_threshold: 1
+    path_failure_threshold: 3
+    path_failure_window_sec: 30.0
+    path_failure_pause_sec: 0.0
+    max_path_check_attempts_per_cycle: 5
+    visited_goal_radius_m: 0.90
+    visited_goal_duration_sec: 180.0
+    max_visited_goals: 50
+    nav_xy_goal_tolerance_m: 0.25
+    min_goal_distance_margin_m: 0.25
+    enable_stuck_watchdog: true
+    stuck_check_radius_m: 0.15
+    stuck_timeout_sec: 60.0
+    enable_costmap_recovery: true
+    clear_global_costmap_service: /global_costmap/clear_entirely_global_costmap
+    clear_local_costmap_service: /local_costmap/clear_entirely_local_costmap
+    recovery_backup_duration_sec: 2.0
+    recovery_backup_linear_vel: -0.05
+    recovery_wait_after_clear_sec: 1.0
 
-    control_period_sec: 2.0
-    goal_cooldown_sec: 3.0
-    blacklist_duration_sec: 90.0
-    blacklist_radius_m: 1.0
-    nav_timeout_sec: 25.0
+    control_period_sec: 1.0
+    goal_cooldown_sec: 1.0
+    blacklist_duration_sec: 30.0
+    blacklist_radius_m: 0.50
+    # nav_timeout_sec=0 disables hard timeout. The stuck watchdog handles real stalls.
+    nav_timeout_sec: 0.0
 
     unknown_value: -1
     free_max_value: 25
     occupied_min_value: 65
 
     min_frontier_cells: 20
-    min_goal_distance_m: 0.6
-    max_goal_distance_m: 8.0
-    goal_clearance_radius_m: 0.20
-    goal_backoff_m: 0.40
-    same_goal_tolerance_m: 0.30
+    min_goal_distance_m: 0.80
+    # Keep goals close so mapping expands sequentially instead of jumping far ahead.
+    max_goal_distance_m: 5.0
+    goal_clearance_radius_m: 0.25
+    unknown_clearance_radius_m: 0.05
+    goal_backoff_m: 0.25
+    same_goal_tolerance_m: 1.00
 
-    lambda_distance: 0.08
+    # Stronger distance penalty favors nearby frontiers while preserving entropy scoring.
+    lambda_distance: 0.18
     entropy_weight: 1.0
-    frontier_size_weight: 0.05
+    frontier_size_weight: 0.02
     frontier_size_norm_cells: 80.0
     entropy_neighborhood_radius_cells: 2
 

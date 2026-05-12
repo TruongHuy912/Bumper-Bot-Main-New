@@ -9,12 +9,21 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     use_slam = LaunchConfiguration("use_slam")
+    use_sim_time = LaunchConfiguration("use_sim_time")
     world_name = LaunchConfiguration("world_name")
     autostart = LaunchConfiguration("autostart")
+    spawn_x = LaunchConfiguration("spawn_x")
+    spawn_y = LaunchConfiguration("spawn_y")
+    spawn_z = LaunchConfiguration("spawn_z")
+    spawn_yaw = LaunchConfiguration("spawn_yaw")
 
     use_slam_arg = DeclareLaunchArgument(
         "use_slam",
         default_value="false"
+    )
+    use_sim_time_arg = DeclareLaunchArgument(
+        "use_sim_time",
+        default_value="true"
     )
     world_name_arg = DeclareLaunchArgument(
         "world_name",
@@ -23,6 +32,22 @@ def generate_launch_description():
     autostart_arg = DeclareLaunchArgument(
         "autostart",
         default_value="true"
+    )
+    spawn_x_arg = DeclareLaunchArgument(
+        "spawn_x",
+        default_value="-0.5"
+    )
+    spawn_y_arg = DeclareLaunchArgument(
+        "spawn_y",
+        default_value="0.0"
+    )
+    spawn_z_arg = DeclareLaunchArgument(
+        "spawn_z",
+        default_value="0.05"
+    )
+    spawn_yaw_arg = DeclareLaunchArgument(
+        "spawn_yaw",
+        default_value="0.0"
     )
 
     gazebo = IncludeLaunchDescription(
@@ -33,6 +58,10 @@ def generate_launch_description():
         ),
         launch_arguments={
             "world_name": world_name,
+            "spawn_x": spawn_x,
+            "spawn_y": spawn_y,
+            "spawn_z": spawn_z,
+            "spawn_yaw": spawn_yaw,
         }.items(),
     )
     
@@ -44,7 +73,8 @@ def generate_launch_description():
         ),
         launch_arguments={
             "use_simple_controller": "False",
-            "use_python": "False"
+            "use_python": "False",
+            "use_sim_time": use_sim_time,
         }.items(),
     )
     
@@ -55,7 +85,7 @@ def generate_launch_description():
             "joystick_teleop.launch.py"
         ),
         launch_arguments={
-            "use_sim_time": "True"
+            "use_sim_time": use_sim_time
         }.items()
     )
 
@@ -65,6 +95,9 @@ def generate_launch_description():
             "launch",
             "global_localization.launch.py"
         ),
+        launch_arguments={
+            "use_sim_time": use_sim_time,
+        }.items(),
         condition=UnlessCondition(use_slam)
     )
 
@@ -74,6 +107,9 @@ def generate_launch_description():
             "launch",
             "slam.launch.py"
         ),
+        launch_arguments={
+            "use_sim_time": use_sim_time,
+        }.items(),
         condition=IfCondition(use_slam)
     )
 
@@ -84,6 +120,7 @@ def generate_launch_description():
             "navigation.launch.py"
         ),
         launch_arguments={
+            "use_sim_time": use_sim_time,
             "autostart": autostart,
         }.items(),
     )
@@ -103,8 +140,13 @@ def generate_launch_description():
     
     return LaunchDescription([
         use_slam_arg,
+        use_sim_time_arg,
         world_name_arg,
         autostart_arg,
+        spawn_x_arg,
+        spawn_y_arg,
+        spawn_z_arg,
+        spawn_yaw_arg,
         gazebo,
         controller,
         joystick,
